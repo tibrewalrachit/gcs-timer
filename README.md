@@ -60,7 +60,7 @@ HSPICE is a transistor-level simulation tool that is inherently more accurate th
 By default (`EVALUATE=0`), GCS-Timer generates the arrival time of each output port, which can be compared with PrimeTime's timing results in `test.pt`. This comparison is for reference only, as there are no "golden" results (GBA is beyond the capabilities of HSPICE). Nevertheless, we believe that GCS-Timer is more accurate than PrimeTime, because GBA essentially accumulates cell/net delays in a graph and the individual cell/net delays calculated by GCS-Timer are more accurate.
 
 ## Contact
-[Shiju Lin](https://shijulin.github.io/) (email: sjlin@cse.cuhk.edu.hk)
+[Shiju Lin]([https://shijulin.github.io/](https://personal.hkust-gz.edu.cn/shijulin/)) (email: shijulin@hkust-gz.edu.cn)
 
 ## License
 BSD 3-Clause License
