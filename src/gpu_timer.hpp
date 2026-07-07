@@ -2504,7 +2504,10 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             build_input_mat<<<input_num * 2, max_RC_node_count + 1>>> (input_node2_acc_num, input_num);
 
             if(SETUP_MODE == 1) {
-                int scap = block_setup_scap((const void*)block_input_inv_full);
+                // Cap the fused path at 64x64: sizing shared memory for one
+                // ~110-node net costs a whole SM per block and starves
+                // occupancy for the mostly-tiny matrices.
+                int scap = min(block_setup_scap((const void*)block_input_inv_full), 64);
                 // Oversized nets (n+1 > scap, the first K of the size-sorted
                 // list) keep the wide per-pivot chain: a single latency-bound
                 // block is slower than the old path for a handful of very
