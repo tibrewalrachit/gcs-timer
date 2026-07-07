@@ -34,10 +34,16 @@ restricted chain for the few oversized input nets).
 
 | bench | pass0 setup | pass1 setup | input nets | design load | GPU STA total |
 |-------|-------------|-------------|------------|-------------|---------------|
-| mul   | 11.2 → 8.3  | 13.8 → 13.0 | 57.1 → TBD | 414 → 417   | 122.1 → 118.6 |
-| log2  | 12.3 → 8.9  | 15.0 → 13.7 | 22.1 → TBD | 634 → 563   | 171.8 → 165.0 |
-| div   | 20.5 → 20.3 | 24.4 → 31.6 | 68.4 → TBD | 1771 → 1655 | 379.1 → 371.7 |
-| hyp   | 63.1 → 43.3 | 79.8 → 68.6 | 204.6 → TBD| 3654 → 3557 | 2306.2 → 2263.2 |
+| mul   | 11.2 → 8.3  | 13.8 → 13.0 | 57.1 → 58.9 | 414 → 417   | 122.1 → 118.6 |
+| log2  | 12.3 → 8.9  | 15.0 → 13.7 | 22.1 → 24.5 | 634 → 563   | 171.8 → 165.0 |
+| div   | 20.5 → 20.3 | 24.4 → 31.6 | 68.4 → 70.8 | 1771 → 1655 | 379.1 → 371.7 |
+| hyp   | 63.1 → 43.3 | 79.8 → 68.6 | 204.6 → 206.7 | 3654 → 3557 | 2306.2 → 2263.2 |
+
+Methodology note: Modal B200 instances show visible run-to-run variance
+(one contended run measured the untouched init section at 1.75× and
+pass1 simulate at 4.5× their usual values). Numbers above are from
+clean runs; later phases should confirm speedups with repeated runs
+before drawing conclusions from deltas under ~20%.
 
 Observations:
 
