@@ -64,11 +64,12 @@ image = (
     .run_commands(
         "cd /app/bm/div && unzip -o test.spef.zip && rm test.spef.zip",
         "cd /app/bm/hyp && unzip -o test.spef.zip && rm test.spef.zip",
-        f"cd /app && nvcc src/main.cpp {NVCC_FLAGS} -o GCS_Timer & "
+        "cd /app && ("
+        f"nvcc src/main.cpp {NVCC_FLAGS} -o GCS_Timer & "
         f"nvcc src/main.cpp {NVCC_FLAGS} -DEVALUATE=1 -o GCS_Timer_eval & "
         f"nvcc src/main.cpp {NVCC_FLAGS} -DGCS_PRECISION=32 -o GCS_Timer_f32 & "
         f"nvcc src/main.cpp {NVCC_FLAGS} -DEVALUATE=1 -DGCS_PRECISION=32 -o GCS_Timer_eval_f32 & "
-        "wait && ls -l /app/GCS_Timer*",
+        "wait) && ls -l /app/GCS_Timer_eval_f32 GCS_Timer_f32 GCS_Timer_eval GCS_Timer",
     )
 )
 

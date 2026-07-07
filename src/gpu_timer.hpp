@@ -178,6 +178,9 @@ __managed__ double *RC_g, *RC_inv, *RC_cap_g;
 __managed__ int *inode2_acc_num_to_net, *RC_port_acc_num, *RC_port_gate_id, *RC_port_cell_id, *RC_port_pin_id, *RC_res_node0, *RC_res_node1;
 __managed__ int *cell_ipin_acc_num, *gate_ipin_acc_num, *stage_node_acc_num;
 __managed__ double *RC_node_cap, *RC_res, *cell_ipin_nldm_cap, *basic_mat, *inslew, *stage_cap_g;
+// Transposed real_t copies of the inverses consumed by the timestep loops
+// (coalesced: thread t reads rinv[i*n + t]); converted after each setup.
+__managed__ real_t *stage_rinv, *input_rinv;
 int *inode2_acc_num_to_net_cpu, *stage_node_acc_num_cpu;
 
 
@@ -942,9 +945,6 @@ __device__ const double VP[] = {0.01 * VDD, 0.02 * VDD, 0.05 * VDD, 0.1 * VDD, 0
 __managed__ int *stage_driver_gate_id, *stage_driver_ipin, *stage_signal, *stage_net_id, *stage_arc_id;
 __managed__ int *ccs_acc_ilen, *ccs_acc_olen, *ccs_acc_tlen;
 __managed__ double *ccs_refer_time, *ccs_input_slew, *ccs_output_cap, *ccs_tp, *stage_g, *stage_inv;
-// Transposed real_t copies of the inverses consumed by the timestep loops
-// (coalesced: thread t reads rinv[i*n + t]); converted after each setup.
-__managed__ real_t *stage_rinv, *input_rinv;
 
 __device__ double inbound(double x, double l, double r) {
     if(x < l) return l;
