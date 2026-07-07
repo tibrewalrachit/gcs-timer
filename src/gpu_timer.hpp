@@ -90,6 +90,19 @@ namespace GPU_TIMER {
 #ifndef EVALUATE
 #define EVALUATE 0
 #endif
+
+// Phase 2: precision of the simulation-side inverse matrices (the dominant
+// memory traffic: an n x n mat-vec per timestep). GCS_PRECISION=32 stores
+// them in FP32; all voltage-state accumulation, crossing-time interpolation
+// and arrival-time propagation stay FP64. Build with -DGCS_PRECISION=32.
+#ifndef GCS_PRECISION
+#define GCS_PRECISION 64
+#endif
+#if GCS_PRECISION == 32
+typedef float real_t;
+#else
+typedef double real_t;
+#endif
 #define TABLE_LEN 7
 #define DELTA_T 2.5
 #define THREAD_NUM 512
@@ -891,7 +904,8 @@ __global__ void calc_delay_input_new(int *input_node2_acc_num, int tot_node2, do
 
 
     const double deltaT = DELTA_T, V_T_SLOPE = 0.8 * VDD / input_slew;
-    double *inv = input_inv + node2_offset, cap_g = 0;
+    const real_t *inv = input_rinv + node2_offset;  // transposed
+    double cap_g = 0;
     if(threadIdx.x < n) cap_g = input_cap_g[node2_offset + threadIdx.x];
 
 
@@ -902,7 +916,7 @@ __global__ void calc_delay_input_new(int *input_node2_acc_num, int tot_node2, do
         __syncthreads();
         if(threadIdx.x < n) {
             curV = 0;
-            for(int i = 0; i <= n; i++) curV += inv[idx(threadIdx.x, i, n + 1)] * I_src[i];            
+            for(int i = 0; i <= n; i++) curV += inv[i * (n + 1) + threadIdx.x] * I_src[i];
             lastI = cap_g * (curV - lastV) - lastI;
             if(threadIdx.x < m && lastV < 0.1 * VDD && curV >= 0.1 * VDD)
                 port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.1 * VDD);
@@ -928,6 +942,9 @@ __device__ const double VP[] = {0.01 * VDD, 0.02 * VDD, 0.05 * VDD, 0.1 * VDD, 0
 __managed__ int *stage_driver_gate_id, *stage_driver_ipin, *stage_signal, *stage_net_id, *stage_arc_id;
 __managed__ int *ccs_acc_ilen, *ccs_acc_olen, *ccs_acc_tlen;
 __managed__ double *ccs_refer_time, *ccs_input_slew, *ccs_output_cap, *ccs_tp, *stage_g, *stage_inv;
+// Transposed real_t copies of the inverses consumed by the timestep loops
+// (coalesced: thread t reads rinv[i*n + t]); converted after each setup.
+__managed__ real_t *stage_rinv, *input_rinv;
 
 __device__ double inbound(double x, double l, double r) {
     if(x < l) return l;
@@ -1637,6 +1654,7 @@ void design::init_graph_GPU() {
     cudaMalloc(&stage_cap_g, (INV3 ? 3 : 2) * stage_node_acc_num_cpu[stage_num] * sizeof(double));
     cudaMalloc(&stage_g, (INV3 ? 3 : 2) * stage_node2_acc_num_cpu[stage_num] * sizeof(double));
     cudaMalloc(&stage_inv, (INV3 ? 3 : 2) * stage_node2_acc_num_cpu[stage_num] * sizeof(double));
+    cudaMalloc(&stage_rinv, (INV3 ? 3 : 2) * stage_node2_acc_num_cpu[stage_num] * sizeof(real_t));
 
     cerr << stage_node2_acc_num_cpu[stage_num] / 1024.0 / 1024 / 1024 * 6 * sizeof(double) << "GB" << endl;
 
@@ -2130,6 +2148,27 @@ __global__ void block_RC_prebuild(int *net_type_dev, int scap) {
     }
 }
 
+// Phase 2: convert the FP64 stage/input inverses into the transposed real_t
+// arrays the timestep loops read. Works for both -setup modes.
+__global__ void stage_inv_transpose(int ncopy) {
+    int stage_id = blockIdx.x, net_id = stage_net_id[stage_id];
+    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
+    for(int c = 0; c < ncopy; c++) {
+        double *inv = stage_inv + stage_node2_acc_num[stage_id] + c * stage_node2_acc_num[stage_num];
+        real_t *rinv = stage_rinv + stage_node2_acc_num[stage_id] + c * stage_node2_acc_num[stage_num];
+        for(int e = threadIdx.x; e < n * n; e += blockDim.x)
+            rinv[(e % n) * n + e / n] = inv[e];
+    }
+}
+__global__ void input_inv_transpose(int *input_node2_acc_num, int input_num, int tot) {
+    int signal = blockIdx.x / input_num, net_index = blockIdx.x % input_num;
+    int net_id = input_nets[net_index], s = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id] + 1;
+    double *inv = input_inv + signal * tot + input_node2_acc_num[net_index];
+    real_t *rinv = input_rinv + signal * tot + input_node2_acc_num[net_index];
+    for(int e = threadIdx.x; e < s * s; e += blockDim.x)
+        rinv[(e % s) * s + e / s] = inv[e];
+}
+
 // Largest matrix dimension whose (g, inv) pair fits in one block's dynamic
 // shared memory; also opts the kernel into the full per-block carveout.
 int block_setup_scap(const void *func) {
@@ -2154,7 +2193,8 @@ __global__ void pass0(int stage_offset) {
     int RC_node_offset = RC_node_acc_num[net_id], n = RC_node_acc_num[net_id + 1] - RC_node_offset;
     int RC_port_offset = RC_port_acc_num[net_id], m = RC_port_acc_num[net_id + 1] - RC_port_offset;
     int olen = ccs_acc_olen[arc_id + 1] - ccs_acc_olen[arc_id];
-    double *initial_tp = ccs_tp + ccs_acc_tlen[arc_id], *inv = stage_inv + stage_node2_acc_num[stage_id];
+    double *initial_tp = ccs_tp + ccs_acc_tlen[arc_id];
+    const real_t *inv = stage_rinv + stage_node2_acc_num[stage_id];  // transposed
     double *I_src = shared, *output_cap = I_src + n, *tp = output_cap + olen + 2;
     double cap_g, slew = inslew[gate_ipin_acc_num[gate_num] * isignal + gate_ipin_acc_num[gate_id] + ipin];
 
@@ -2210,14 +2250,14 @@ __global__ void pass0(int stage_offset) {
         sim_time += deltaT;
         if(threadIdx.x < n) I_src[threadIdx.x] = cap_g * lastV + lastI;
         __syncthreads();
-        if(threadIdx.x < n) for(int i = curV = 0; i < n; i++) curV += inv[idx(threadIdx.x, i, n)] * I_src[i];
+        if(threadIdx.x < n) for(int i = curV = 0; i < n; i++) curV += inv[i * n + threadIdx.x] * I_src[i];
         if(threadIdx.x == 0) {
             isrc0 = cuda_getI(lastV, sim_time, olen, tp, output_cap);
-            isrc0 = cuda_getI(curV + inv[idx(threadIdx.x, 0, n)] * isrc0, sim_time, olen, tp, output_cap);
+            isrc0 = cuda_getI(curV + inv[threadIdx.x] * isrc0, sim_time, olen, tp, output_cap);
         }
         __syncthreads();
         if(threadIdx.x < n) {
-            curV += inv[idx(threadIdx.x, 0, n)] * isrc0;
+            curV += inv[threadIdx.x] * isrc0;
             lastI = cap_g * (curV - lastV) - lastI;
         }
         if(threadIdx.x < m && lastV < 0.1 * VDD && curV >= 0.1 * VDD) {
@@ -2283,7 +2323,8 @@ __global__ void pass1(int stage_offset) {
     int RC_node_offset = RC_node_acc_num[net_id], n = RC_node_acc_num[net_id + 1] - RC_node_offset;
     int RC_port_offset = RC_port_acc_num[net_id], m = RC_port_acc_num[net_id + 1] - RC_port_offset;
     int olen = ccs_acc_olen[arc_id + 1] - ccs_acc_olen[arc_id];
-    double *initial_tp = ccs_tp + ccs_acc_tlen[arc_id], *inv = stage_inv + stage_node2_acc_num[stage_id];
+    double *initial_tp = ccs_tp + ccs_acc_tlen[arc_id];
+    const real_t *inv = stage_rinv + stage_node2_acc_num[stage_id];  // transposed
     double *I_src = shared, *output_cap = I_src + n, *tp = output_cap + olen + 2;
     double cap_g;
     __shared__ double ref_time;
@@ -2341,18 +2382,18 @@ __global__ void pass1(int stage_offset) {
         sim_time += deltaT;
         if(threadIdx.x < n) I_src[threadIdx.x] = cap_g * lastV + lastI;
         __syncthreads();
-        if(threadIdx.x < n) for(int i = curV = 0; i < n; i++) curV += inv[idx(threadIdx.x, i, n)] * I_src[i];
+        if(threadIdx.x < n) for(int i = curV = 0; i < n; i++) curV += inv[i * n + threadIdx.x] * I_src[i];
         if(threadIdx.x == 0) {
             isrc0 = cuda_getI(lastV, sim_time, olen, tp, output_cap);
-            isrc0 = cuda_getI(curV + inv[idx(threadIdx.x, 0, n)] * isrc0, sim_time, olen, tp, output_cap);
+            isrc0 = cuda_getI(curV + inv[threadIdx.x] * isrc0, sim_time, olen, tp, output_cap);
         }
         __syncthreads();
         if(threadIdx.x < n) {
-            curV += inv[idx(threadIdx.x, 0, n)] * isrc0;
+            curV += inv[threadIdx.x] * isrc0;
             lastI = cap_g * (curV - lastV) - lastI;
         }
         if(threadIdx.x < m) {
-            if(lastV < 0.1 * VDD && curV >= 0.1 * VDD) 
+            if(lastV < 0.1 * VDD && curV >= 0.1 * VDD)
                 port_slew = lerp(sim_time - deltaT, sim_time, lastV, curV, 0.1 * VDD);
             if(lastV < 0.5 * VDD && curV >= 0.5 * VDD && !reach50) {
                 port_time = lerp(sim_time - deltaT, sim_time, lastV, curV, 0.5 * VDD);
@@ -2491,6 +2532,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             for(int i = max_RC_node_count; i >= 1; i--) RC_size_count[i - 1] += RC_size_count[i];
             cudaMalloc(&input_g, 2 * sizeof(double) * input_node2_acc_num_cpu[input_num]);
             cudaMalloc(&input_inv, 2 * sizeof(double) * input_node2_acc_num_cpu[input_num]);
+            cudaMalloc(&input_rinv, 2 * sizeof(real_t) * input_node2_acc_num_cpu[input_num]);
             cudaMalloc(&input_cap_g, 2 * sizeof(double) * input_node2_acc_num_cpu[input_num]);
             cudaMalloc(&input_node2_acc_num, sizeof(int) * (input_num + 1));
             cudaMemcpy(input_node2_acc_num, input_node2_acc_num_cpu, sizeof(int) * (input_num + 1), cudaMemcpyHostToDevice);
@@ -2539,6 +2581,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
                     (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[input_num], input_node2_acc_num_cpu[input_num], 0, 2);
             }
 
+            input_inv_transpose<<<input_num * 2, SETUP_THREADS>>> (input_node2_acc_num, input_num, input_node2_acc_num_cpu[input_num]);
             calc_delay_input_new<<<input_num, max_RC_node_count + 1, (max_RC_node_count + 1) * sizeof(double)>>> (input_node2_acc_num, input_node2_acc_num_cpu[input_num], 20, 0);
             calc_delay_input_new<<<input_num, max_RC_node_count + 1, (max_RC_node_count + 1) * sizeof(double)>>> (input_node2_acc_num, input_node2_acc_num_cpu[input_num], 20, 1);
         }
@@ -2566,6 +2609,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 0);//rely on build_stage_invBC(0)
         }
 
+        stage_inv_transpose<<<stage_num, SETUP_THREADS>>> (1);
         cudaDeviceSynchronize();
         assert(cudaGetLastError() == cudaSuccess);
         sec_setup0.end();
@@ -2598,6 +2642,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
 
             build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 1);//rely on build_stage_invBC(0)
         }
+        stage_inv_transpose<<<stage_num, SETUP_THREADS>>> (INV3 ? 3 : 2);
         sec_setup1.end();
         {
             GCS_PROF::GpuSection sec_pass1("pass1 simulate (size groups)");
