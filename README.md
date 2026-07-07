@@ -47,6 +47,21 @@ Running `mul` on CPU
 
 The spef files of `div` and `hyp` are zipped and need to be unzipped first.
 
+## Running on Modal Labs (H100)
+
+`modal_app.py` packages the whole flow (downloading the ASAP7 libs, unzipping the spef files, compiling with `-arch=sm_90` and running) into a [Modal](https://modal.com) app that executes on an H100 GPU.
+
+```bash
+pip install modal
+modal token set --token-id <id> --token-secret <secret>   # or `modal setup`
+
+modal run modal_app.py                        # run 'mul' on the H100
+modal run modal_app.py --benchmark log2       # any of: mul, log2, div, hyp, all
+modal run modal_app.py --benchmark mul --cpu  # CPU version for comparison
+```
+
+The first run builds the container image (fetches the ASAP7 CCS liberty files and compiles GCS-Timer); subsequent runs reuse the cached image and start immediately.
+
 ## Benchmarks and Evaluation
 
 The benchmarks are the four largest arithmetic designs from the [EPFL combinational benchmark suite](https://www.epfl.ch/labs/lsi/page-102566-en-html/benchmarks/). They are synthesized, placed and routed using commercial tools. Each design consists of a verilog file (`test.v`) and a spef file (`test.spef`) for timing analysis. Delay results of each cell and net are provided in `pt_cell.results/pt_net.results` (by PrimeTime) and `spice_deck_all.txt` (by HSPICE). `test.pt` contains the graph-based analysis results by PrimeTime.
