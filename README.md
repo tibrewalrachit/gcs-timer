@@ -62,6 +62,29 @@ modal run modal_app.py --benchmark mul --cpu  # CPU version for comparison
 
 The first run builds the container image (fetches the ASAP7 CCS liberty files and compiles GCS-Timer); subsequent runs reuse the cached image and start immediately.
 
+## Timing Debug Agent
+
+`debug_agent/` implements an LLM-based timing debugging assistant modeled on ["Timing Analysis Agent: Autonomous Multi-Corner Multi-Mode (MCMM) Timing Debugging with Timing Debug Relation Graph"](https://arxiv.org/abs/2504.11502) (Nainani et al., NVIDIA), adapted to GCS-Timer's reports:
+
+* a **Structural Report Database** parses GCS-Timer's output AT report plus the PrimeTime (`test.pt`, `pt_cell.results`, `pt_net.results`) and HSPICE (`spice_deck_all.txt`) references shipped with each benchmark;
+* a **Timing Debug Relation Graph (TDRG)** connects those reports with expert debug relations (e.g. endpoint AT mismatch → stage-delay distributions → HSPICE golden comparison);
+* a three-level agent hierarchy — **Planner** (across benchmarks) → **TDRG Traversal** (across reports) → **Expert Report Agent** (agentic *coding* retrieval that writes Python against the report database) — answers debug questions with Claude.
+
+Run it on Modal right after the H100 timing run (create a Modal secret named `anthropic-api-key` holding your `ANTHROPIC_API_KEY` first):
+
+```bash
+modal secret create anthropic-api-key ANTHROPIC_API_KEY=sk-ant-...
+modal run modal_app.py --benchmark mul --question \
+  "Which output ports disagree most between GCS-Timer and PrimeTime, and what is the likely cause?"
+```
+
+Or locally against the shipped reports:
+
+```bash
+pip install anthropic
+python -m debug_agent --benchmark mul --gcs-output run.log --question "..."
+```
+
 ## Benchmarks and Evaluation
 
 The benchmarks are the four largest arithmetic designs from the [EPFL combinational benchmark suite](https://www.epfl.ch/labs/lsi/page-102566-en-html/benchmarks/). They are synthesized, placed and routed using commercial tools. Each design consists of a verilog file (`test.v`) and a spef file (`test.spef`) for timing analysis. Delay results of each cell and net are provided in `pt_cell.results/pt_net.results` (by PrimeTime) and `spice_deck_all.txt` (by HSPICE). `test.pt` contains the graph-based analysis results by PrimeTime.

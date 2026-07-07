@@ -45,8 +45,10 @@ image = (
         f"mkdir -p /app/lib && {_copy_libs}",
         "rm -rf /tmp/asap7 && ls -lh /app/lib",
     )
+    .pip_install("anthropic")
     .add_local_dir("src", "/app/src", copy=True)
     .add_local_dir("bm", "/app/bm", copy=True)
+    .add_local_dir("debug_agent", "/app/debug_agent", copy=True)
     .run_commands(
         "cd /app/bm/div && unzip -o test.spef.zip && rm test.spef.zip",
         "cd /app/bm/hyp && unzip -o test.spef.zip && rm test.spef.zip",
@@ -70,8 +72,40 @@ def run_gcs_timer(benchmark: str = "mul", cpu: bool = False) -> str:
     return output
 
 
+@app.function(
+    image=image,
+    gpu="H100",
+    cpu=8,
+    memory=32768,
+    timeout=3600,
+    secrets=[modal.Secret.from_name("anthropic-api-key")],
+)
+def debug_gcs_timer(question: str, benchmark: str = "mul") -> str:
+    """Run GCS-Timer on the H100, then debug its results with the timing
+    analysis agent (arXiv:2504.11502-style TDRG + hierarchical agents)."""
+    import sys
+
+    sys.path.insert(0, "/app")
+    from debug_agent import ReportDB, debug_question
+
+    benchmarks = ["mul", "log2", "div", "hyp"] if benchmark == "all" else [benchmark]
+    dbs = {}
+    for bm in benchmarks:
+        stdout = run_gcs_timer.local(benchmark=bm)
+        dbs[bm] = ReportDB(f"/app/bm/{bm}", stdout)
+    answer = debug_question(question, dbs)
+    print("\n===== TIMING DEBUG AGENT ANSWER =====\n" + answer, flush=True)
+    return answer
+
+
 @app.local_entrypoint()
-def main(benchmark: str = "mul", cpu: bool = False):
+def main(benchmark: str = "mul", cpu: bool = False, question: str = ""):
+    """Run benchmarks on the H100; pass --question '...' to also run the
+    timing debug agent on the results (needs Modal secret 'anthropic-api-key'
+    containing ANTHROPIC_API_KEY)."""
+    if question:
+        debug_gcs_timer.remote(question=question, benchmark=benchmark)
+        return
     benchmarks = ["mul", "log2", "div", "hyp"] if benchmark == "all" else [benchmark]
     for bm in benchmarks:
         print(f"\n===== {bm} ({'CPU' if cpu else 'GPU'}) =====")
