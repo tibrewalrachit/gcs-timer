@@ -2072,16 +2072,14 @@ __global__ void block_input_inv_full(int *input_node2_acc_num, int input_num, in
     int net_id = input_nets[net_index], s = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id] + 1;
     double *gG = input_g + signal * tot + input_node2_acc_num[net_index];
     double *invG = input_inv + signal * tot + input_node2_acc_num[net_index];
-    if(s <= scap) {
-        double *gS = sh, *invS = sh + s * s;
-        for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
-            gS[e] = gG[e];
-            invS[e] = (e / s == e % s ? 1 : 0);
-        }
-        block_gj_inverse(gS, s, invS, s, s);
-        for(int e = threadIdx.x; e < s * s; e += blockDim.x) invG[e] = invS[e];
-    } else
-        block_gj_inverse(gG, s, invG, s, s);
+    if(s > scap) return;  // oversized nets are handled by the old per-pivot chain
+    double *gS = sh, *invS = sh + s * s;
+    for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
+        gS[e] = gG[e];
+        invS[e] = (e / s == e % s ? 1 : 0);
+    }
+    block_gj_inverse(gS, s, invS, s, s);
+    for(int e = threadIdx.x; e < s * s; e += blockDim.x) invG[e] = invS[e];
 }
 
 // Fused replacement for the prebuild_RC_invD pivot chain + build_RC_invBC +
@@ -2506,12 +2504,27 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             build_input_mat<<<input_num * 2, max_RC_node_count + 1>>> (input_node2_acc_num, input_num);
 
             if(SETUP_MODE == 1) {
-                int max_s = 0;
-                for(int i = 0; i < input_num; i++) max_s = max(max_s, nets[input_nets_cpu[i]].n + 1);
                 int scap = block_setup_scap((const void*)block_input_inv_full);
-                int sfit = min(scap, max_s);
-                block_input_inv_full<<<input_num * 2, SETUP_THREADS, 2 * sfit * sfit * sizeof(double)>>>
-                    (input_node2_acc_num, input_num, input_node2_acc_num_cpu[input_num], scap);
+                // Oversized nets (n+1 > scap, the first K of the size-sorted
+                // list) keep the wide per-pivot chain: a single latency-bound
+                // block is slower than the old path for a handful of very
+                // large matrices. Everything else is one fused launch.
+                int K = 0, sfit = 0;
+                while(K < input_num && nets[input_nets_cpu[K]].n + 1 > scap) K++;
+                if(K < input_num) sfit = nets[input_nets_cpu[K]].n + 1;
+                if(K > 0) {
+                    for(int i = 0; i <= max_RC_node_count; i++) { int cnt = min(RC_size_count[i], K); if(cnt > 0)
+                        build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[cnt]), THREAD_NUM>>>
+                            (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[cnt], input_node2_acc_num_cpu[input_num], i, 0); }
+                    for(int i = max_RC_node_count; i >= 0; i--) { int cnt = min(RC_size_count[i], K); if(cnt > 0)
+                        build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[cnt]), THREAD_NUM>>>
+                            (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[cnt], input_node2_acc_num_cpu[input_num], i, 1); }
+                    build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[K]), THREAD_NUM>>>
+                        (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[K], input_node2_acc_num_cpu[input_num], 0, 2);
+                }
+                if(K < input_num)
+                    block_input_inv_full<<<input_num * 2, 1024, 2 * sfit * sfit * sizeof(double)>>>
+                        (input_node2_acc_num, input_num, input_node2_acc_num_cpu[input_num], scap);
             } else {
                 for(int i = 0; i <= max_RC_node_count; i++) if(RC_size_count[i] > 0)
                     build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[RC_size_count[i]]), THREAD_NUM>>>
