@@ -30,7 +30,11 @@ NVCC_FLAGS = (
     "-gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100"
 )
 
-ASAP7_REPO = "https://github.com/The-OpenROAD-Project/asap7sc7p5t_28.git"
+# The ASAP7 CCS liberty files ship as small .lib.7z archives; download just
+# the four GCS-Timer needs (raw URL, falling back to the media URL in case a
+# file is stored in Git LFS and raw returns a pointer stub).
+ASAP7_RAW = "https://raw.githubusercontent.com/The-OpenROAD-Project/asap7sc7p5t_28/master/LIB/CCS"
+ASAP7_MEDIA = "https://media.githubusercontent.com/media/The-OpenROAD-Project/asap7sc7p5t_28/master/LIB/CCS"
 LIB_FILES = [
     "asap7sc7p5t_INVBUF_RVT_TT_ccs_220122",
     "asap7sc7p5t_SIMPLE_RVT_TT_ccs_211120",
@@ -38,23 +42,20 @@ LIB_FILES = [
     "asap7sc7p5t_OA_RVT_TT_ccs_211120",
 ]
 
-_copy_libs = " && ".join(
-    f"if [ -f /tmp/asap7/LIB/CCS/{f}.lib ]; then cp /tmp/asap7/LIB/CCS/{f}.lib /app/lib/; "
-    f"elif [ -f /tmp/asap7/LIB/CCS/{f}.lib.gz ]; then gunzip -c /tmp/asap7/LIB/CCS/{f}.lib.gz > /app/lib/{f}.lib; "
-    f"else echo 'MISSING {f}' && ls /tmp/asap7/LIB/CCS && exit 1; fi"
+_fetch_libs = " && ".join(
+    f"curl -fSL --retry 3 -o /tmp/{f}.lib.7z {ASAP7_RAW}/{f}.lib.7z && "
+    f"if [ $(stat -c%s /tmp/{f}.lib.7z) -lt 10000 ]; then "
+    f"curl -fSL --retry 3 -o /tmp/{f}.lib.7z {ASAP7_MEDIA}/{f}.lib.7z; fi && "
+    f"7z x -o/app/lib /tmp/{f}.lib.7z && test -f /app/lib/{f}.lib && rm /tmp/{f}.lib.7z"
     for f in LIB_FILES
 )
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("git", "git-lfs", "unzip")
+    .apt_install("curl", "unzip", "p7zip-full")
     .run_commands(
-        # Sparse clone keeps the download to just LIB/CCS; lfs pull covers
-        # the case where the .lib files are stored in git-lfs.
-        f"git clone --depth 1 --filter=blob:none --sparse {ASAP7_REPO} /tmp/asap7",
-        "cd /tmp/asap7 && git sparse-checkout set LIB/CCS && (git lfs pull --include 'LIB/CCS/*' || true)",
-        f"mkdir -p /app/lib && {_copy_libs}",
-        "rm -rf /tmp/asap7 && ls -lh /app/lib",
+        f"mkdir -p /app/lib && {_fetch_libs}",
+        "ls -lh /app/lib",
     )
     .pip_install("anthropic")
     .add_local_dir("src", "/app/src", copy=True)
