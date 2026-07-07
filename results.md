@@ -67,3 +67,50 @@ so Cholesky's 2× flop saving is worth ≤ ~20 ms on the largest design.
 Cholesky lands with Phase 2, where the factorization kernels are being
 rewritten for FP32/mixed precision anyway and the arithmetic changes
 regardless.
+
+## Phase 2 — mixed precision + transposed inverses (`GCS_PRECISION=32`)
+
+The timestep loops consume the n×n stage/input inverses once per
+timestep. Two changes: (a) the consumed inverse is now stored
+**transposed** so thread t reads `rinv[i*n+t]` fully coalesced (the old
+`idx(t,i,n)` layout strided by n across the warp); (b) with
+`-DGCS_PRECISION=32` (the `*_f32` binaries) that array is FP32, halving
+its bytes. Voltage-state recurrences, crossing-time interpolation,
+arrival propagation (`atomicMax64`) and every factorization stay FP64 —
+this is the plan's "mixed" configuration. Iterative refinement (2.2) was
+not needed: accuracy passed the ship gate without it (see below).
+
+**Correctness:**
+* FP64 binary (transposed layout only): Output AT reports **bit-identical**
+  to Phase 1 on all four benchmarks.
+* FP32 binaries: EVALUATE MY-SP metrics **identical to the FP64 baseline
+  at reported precision in every category** (e.g. hyp all: 0.39 ps /
+  1.74% in both) — far inside the 0.05% ship gate. FP32 ships; the
+  effective precision of the extracted quantities is set by the FP64
+  state recurrence, not the FP32 inverse elements.
+
+**Timing (ms, B200; Phase 1 → Phase 2 FP64-transposed → Phase 2 FP32):**
+
+| bench | pass0 simulate       | GPU STA total        | device mem (MB)      |
+|-------|----------------------|----------------------|----------------------|
+| mul   | 65.4 → 51.5 → 47.0   | 118.6 → 126.5 → 98.8 | 4236 → 5210 → 4724   |
+| log2  | 105.9 → 84.2 → 77.9  | 165.0 → 144.1 → 137.1| 4808 → 6012 → 5410   |
+| div   | 250.6 → 227.6 → 222.4| 371.7 → 350.0 → 359.2| 7576 → 9646 → 8612   |
+| hyp   | 1944.5 → 1721.2 → 1670.4 | 2263.2 → 2086.3 → 2034.3 | 19726 → 25474 → 22602 |
+
+Observations:
+
+* The transpose (coalescing) is worth ~10–12% of pass0 alone; FP32 adds
+  a few percent more. Cumulative STA speedup vs the Phase 0 baseline:
+  mul 1.24×, log2 1.25×, hyp 1.13× (div's run hit a noisy instance —
+  its input-nets section inflated 76→127 ms on code that is identical
+  in that section).
+* The muted FP32 gain is diagnostic: with B200's ~126 MB L2, a level's
+  working set of stage inverses is substantially cache-resident, and the
+  level loop exposes launch/sync latency (few resident blocks per small
+  level). pass0 is therefore latency/occupancy-bound as much as
+  bandwidth-bound — exactly what Phase 4 (graphs/queue scheduling) and
+  Phase 3 (tree solvers shrink n² to n) attack.
+* Memory grew (the rinv copy): +29% fp64 / +15% fp32 on hyp. Phase 3.1
+  eliminates the n² arrays for tree nets entirely; Phase 5 can also
+  assemble directly into rinv and drop stage_inv.
