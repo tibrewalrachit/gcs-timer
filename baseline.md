@@ -44,12 +44,47 @@ Observations driving the phase plan:
 ## Accuracy (EVALUATE=1 harness, B200, FP64 baseline)
 
 Stage-delay comparison against HSPICE golden (`MY-SP` = GCS-Timer vs
-HSPICE; `PT-SP` = PrimeTime vs HSPICE). Regression gate for all later
-phases: MY-SP must stay within 0.1% relative / 0.1 ps absolute of these
-values.
+HSPICE; `PT-SP` = PrimeTime vs HSPICE; mean abs error over arcs with
+error ≥ 0.5 ps). **Regression gate for all later phases: MY-SP must stay
+within 0.1% relative / 0.1 ps absolute of these values.**
 
-<!-- PENDING: filled from the --evaluate run -->
+| bench | category  | MY-SP (ps / %) | PT-SP (ps / %) | SP failed |
+|-------|-----------|----------------|----------------|-----------|
+| mul   | cell_fall | 0.59 / 2.95    | 0.58 / 2.44    | 1/65021   |
+| mul   | cell_rise | 0.59 / 2.64    | 0.60 / 2.24    | 3/65021   |
+| mul   | net_fall  | 0.10 / 0.65    | 0.06 / 1.41    | 254/59794 |
+| mul   | net_rise  | 0.21 / 1.56    | 0.18 / 2.30    | 326/59794 |
+| mul   | **all**   | **0.38 / 1.98**| 0.36 / 2.11    | 584/249630|
+| log2  | cell_fall | 0.60 / 2.93    | 0.65 / 2.60    | 14/75085  |
+| log2  | cell_rise | 0.55 / 2.40    | 0.60 / 2.11    | 9/75085   |
+| log2  | net_fall  | 0.10 / 0.58    | 0.07 / 3.54    | 101/74290 |
+| log2  | net_rise  | 0.12 / 0.79    | 0.10 / 3.73    | 183/74290 |
+| log2  | **all**   | **0.35 / 1.68**| 0.36 / 2.99    | 307/298750|
+| div   | cell_fall | 0.59 / 3.32    | 0.57 / 2.66    | 5/212904  |
+| div   | cell_rise | 0.51 / 2.56    | 0.54 / 2.07    | 10/212904 |
+| div   | net_fall  | 0.04 / 0.87    | 0.04 / 4.90    | 110/208661|
+| div   | net_rise  | 0.04 / 0.85    | 0.04 / 4.60    | 162/208661|
+| div   | **all**   | **0.30 / 1.91**| 0.30 / 3.54    | 287/843130|
+| hyp   | cell_fall | 0.67 / 3.23    | 0.66 / 2.77    | 14/418011 |
+| hyp   | cell_rise | 0.61 / 2.49    | 0.63 / 2.11    | 72/418011 |
+| hyp   | net_fall  | 0.11 / 0.45    | 0.11 / 2.01    | 97/403726 |
+| hyp   | net_rise  | 0.16 / 0.71    | 0.14 / 2.24    | 146/403726|
+| hyp   | **all**   | **0.39 / 1.74**| 0.39 / 2.28    | 329/1643474|
 
-## H100 (sm_90) comparison
+EVALUATE-mode update_timing wall (s): mul 2.25, log2 2.40, div 7.09,
+hyp 12.86 (includes reading PT/SPICE golden files).
 
-<!-- PENDING: filled from the GCS_GPU=H100 run -->
+## H100 (sm_90) comparison — same binaries, GCS_GPU=H100
+
+| bench | GPU STA total (ms) | pass0 sim | pass1 sim | mem (MB) |
+|-------|--------------------|-----------|-----------|----------|
+| mul   | 141.7              | 67.8      | 37.2      | 4135     |
+| log2  | 195.2              | 112.5     | 41.9      | 4707     |
+| div   | 431.9              | 254.3     | 101.1     | 7475     |
+| hyp   | 2439.1             | 1971.2    | 214.1     | 19623    |
+
+B200 is only **1.06–1.17× faster than H100** on this FP64,
+level-barrier-bound workload — far below the hardware's potential, which
+is precisely the thesis of Phases 1–5 (B200's FP64 axis is weak; the wins
+must come from FP32/mixed precision, shared-memory factorization, tree
+solvers, and killing the level barriers).
