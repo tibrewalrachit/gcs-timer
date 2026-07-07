@@ -37,7 +37,7 @@ const std::string benchmark_path = "bm/";
 int main(int argc, char* argv[]) {
 
     if(argc < 2) {
-        std::cerr << "usage: " << argv[0] << " <benchmark> [-CPU] [-quiet|-nsys]" << std::endl;
+        std::cerr << "usage: " << argv[0] << " <benchmark> [-CPU] [-quiet|-nsys] [-setup=block|global]" << std::endl;
         return 1;
     }
     bool useCPU = false;
@@ -45,6 +45,8 @@ int main(int argc, char* argv[]) {
         std::string arg(argv[i]);
         if(arg == "-CPU") useCPU = true;
         else if(arg == "-quiet" || arg == "-nsys") GCS_PROF::quiet = true;
+        else if(arg == "-setup=block") GPU_TIMER::SETUP_MODE = 1;
+        else if(arg == "-setup=global") GPU_TIMER::SETUP_MODE = 0;
         else std::cerr << "unknown flag: " << arg << std::endl;
     }
 

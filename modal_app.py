@@ -72,12 +72,14 @@ image = (
 
 @app.function(image=image, gpu=GPU_TYPE, cpu=8, memory=32768, timeout=3600)
 def run_gcs_timer(benchmark: str = "mul", cpu: bool = False,
-                  evaluate: bool = False, quiet: bool = False) -> str:
+                  evaluate: bool = False, quiet: bool = False,
+                  extra: str = "") -> str:
     import subprocess
 
     subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], cwd="/app")
     binary = "./GCS_Timer_eval" if evaluate else "./GCS_Timer"
     cmd = [binary, benchmark] + (["-CPU"] if cpu else []) + (["-quiet"] if quiet else [])
+    cmd += extra.split()
     print(f"$ {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, cwd="/app", capture_output=True, text=True)
     output = result.stdout + result.stderr
@@ -115,7 +117,7 @@ def debug_gcs_timer(question: str, benchmark: str = "mul") -> str:
 
 @app.local_entrypoint()
 def main(benchmark: str = "mul", cpu: bool = False, question: str = "",
-         evaluate: bool = False, quiet: bool = False):
+         evaluate: bool = False, quiet: bool = False, extra: str = ""):
     """Run benchmarks on the GPU selected by GCS_GPU (default B200); pass
     --evaluate to run the EVALUATE=1 accuracy harness, --question '...' to
     run the timing debug agent (needs Modal secret 'anthropic-api-key')."""
@@ -126,4 +128,4 @@ def main(benchmark: str = "mul", cpu: bool = False, question: str = "",
     for bm in benchmarks:
         print(f"\n===== {bm} ({'CPU' if cpu else 'GPU'}"
               f"{', EVALUATE' if evaluate else ''}) =====")
-        run_gcs_timer.remote(benchmark=bm, cpu=cpu, evaluate=evaluate, quiet=quiet)
+        run_gcs_timer.remote(benchmark=bm, cpu=cpu, evaluate=evaluate, quiet=quiet, extra=extra)

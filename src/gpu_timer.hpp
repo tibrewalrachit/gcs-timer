@@ -99,6 +99,11 @@ const double deltaV = 0.01 * VDD;
 #define INV3 0
 using namespace std;
 
+// Phase 1 factorization path: 1 = per-block local (new default),
+// 0 = per-pivot global chain (old, -setup=global).
+int SETUP_MODE = 1;
+#define SETUP_THREADS 256
+
 enum NET_TYPE {INPUT, INTERNAL, OUTPUT};
 const double CAP1_SLEWS_CPU[] = {3.73582, 7.47165, 14.9433, 29.8866, 59.7732, 119.546, 239.093};
 const double CAP2_SLEWS_CPU[] = {6.26418, 12.5284, 25.0567, 50.1134, 100.227, 200.454, 400.907};
@@ -1200,6 +1205,11 @@ T* alloc_cpy(T *vec_cpu, int n) {
     return vec_gpu;
 }
 
+// Phase 1 block-local factorization kernels (defined after the stage/input
+// array declarations, used by prebuild()/update_timing()).
+__global__ void block_RC_prebuild(int *net_type_dev, int scap);
+int block_setup_scap(const void *func);
+
 __global__ void prebuild_RC_invD(int *offset, int *net, int tot_inode2, int pivot, int type) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= tot_inode2) return;
@@ -1254,14 +1264,22 @@ void design:: prebuild() {
     cudaMemcpy(index2net, index2net_cpu, sizeof(int) * tot_inode2, cudaMemcpyHostToDevice);
     cudaMemcpy(index2offset, index2offset_cpu, sizeof(int) * tot_inode2, cudaMemcpyHostToDevice);
     build_RC_g<<<net_num, 1024>>> ();
-    for(int i = 0; i < max_RC_inode_count; i++) if(inode2_sum[i + 1] > 0)
-        prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[i + 1]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[i + 1], i, 0);
-    for(int i = max_RC_inode_count - 1; i >= 0; i--) if(inode2_sum[i + 1] > 0)
-        prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[i + 1]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[i + 1], i, 1);
-    prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[0]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[0], 0, 2);
-    build_RC_invBC<<<net_num, 1024>>> ();
-    build_RC_invA<<<net_num, 1024>>> ();
+    if(SETUP_MODE == 1) {
+        int *net_type_dev = alloc_cpy(net_type_cpu, net_num);
+        int scap = block_setup_scap((const void*)block_RC_prebuild);
+        int sfit = min(scap, max_RC_inode_count);
+        block_RC_prebuild<<<net_num, SETUP_THREADS, 2 * sfit * sfit * sizeof(double)>>> (net_type_dev, scap);
+    } else {
+        for(int i = 0; i < max_RC_inode_count; i++) if(inode2_sum[i + 1] > 0)
+            prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[i + 1]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[i + 1], i, 0);
+        for(int i = max_RC_inode_count - 1; i >= 0; i--) if(inode2_sum[i + 1] > 0)
+            prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[i + 1]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[i + 1], i, 1);
+        prebuild_RC_invD<<<BLOCK_NUM(inode2_sum[0]), THREAD_NUM>>> (index2offset, index2net, inode2_sum[0], 0, 2);
+        build_RC_invBC<<<net_num, 1024>>> ();
+        build_RC_invA<<<net_num, 1024>>> ();
+    }
     cudaDeviceSynchronize();
+    assert(cudaGetLastError() == cudaSuccess);
 
     delete index2net_cpu;
     delete index2offset_cpu;
@@ -1913,6 +1931,222 @@ __global__ void build_stage_invD(int tot_inode2_num, int pass, int offset = 0) {
 
 
 
+// ---------------------------------------------------------------------------
+// Phase 1: per-block local factorization (default, -setup=block).
+//
+// The old path factorizes every matrix with one kernel launch per pivot
+// (2*max_dim+1 launches, each reading/writing all matrices in global
+// memory). The kernels below assign one thread block per stage/net, run the
+// whole Gauss-Jordan locally -- in shared memory when the matrix fits,
+// in-place in global memory otherwise -- and write results back once.
+// Pivot-loop arithmetic is ordered exactly like the old per-pivot kernels,
+// so FP64 results are bit-identical. The old chain remains selectable with
+// -setup=global.
+// ---------------------------------------------------------------------------
+
+// Gauss-Jordan inverse of the s x s system (g, inv) with row strides sg/si,
+// executed by one thread block. Mirrors build_stage_invA/prebuild_RC_invD/
+// build_input_inv type 0 (forward), 1 (backward), 2 (divide) exactly.
+__device__ void block_gj_inverse(double *g, int sg, double *inv, int si, int s) {
+    for(int p = 0; p < s; p++) {
+        __syncthreads();
+        for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
+            int x = e / s, y = e % s;
+            if(x > p) {
+                double coeff = g[x * sg + p] / g[p * sg + p];
+                if(y > p) g[x * sg + y] -= coeff * g[p * sg + y];
+                inv[x * si + y] -= coeff * inv[p * si + y];
+            }
+        }
+    }
+    for(int p = s - 1; p >= 0; p--) {
+        __syncthreads();
+        for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
+            int x = e / s, y = e % s;
+            if(x < p) {
+                double coeff = g[x * sg + p] / g[p * sg + p];
+                if(y > p) g[x * sg + y] -= coeff * g[p * sg + y];
+                inv[x * si + y] -= coeff * inv[p * si + y];
+            }
+        }
+    }
+    __syncthreads();
+    for(int e = threadIdx.x; e < s * s; e += blockDim.x)
+        inv[(e / s) * si + e % s] /= g[(e / s) * sg + (e / s)];
+    __syncthreads();
+}
+
+// Fused replacement for build_stage_matA + the build_stage_invA pivot chain
+// + build_stage_invBC + build_stage_invD: one block per stage builds the
+// port-block matrix A' = (A - B D^-1 C) + pin caps, inverts it locally, and
+// assembles the full n x n stage inverse from the per-net Schur pieces in
+// RC_inv. Writes stage_inv and stage_cap_g only (stage_g is scratch that
+// nothing reads downstream; it is used solely as the fallback workspace when
+// m exceeds the shared-memory capacity scap).
+__global__ void block_stage_setup(int pass, int scap) {
+    extern __shared__ double sh[];
+    int stage_id = blockIdx.x, net_id = stage_net_id[stage_id];
+    int RC_node_offset = RC_node_acc_num[net_id], n = RC_node_acc_num[net_id + 1] - RC_node_offset;
+    int RC_port_offset = RC_port_acc_num[net_id], m = RC_port_acc_num[net_id + 1] - RC_port_offset;
+    double *rc_inv = RC_inv + RC_node2_acc_num[net_id];
+    int ncopy = (pass == 0) ? 1 : (INV3 ? 3 : 2);
+    bool in_smem = (m <= scap);
+    for(int c = 0; c < ncopy; c++) {
+        double *invG = stage_inv + stage_node2_acc_num[stage_id] + c * stage_node2_acc_num[stage_num];
+        double *gS, *invS;
+        int sg, si;
+        if(in_smem) { gS = sh; invS = sh + m * m; sg = si = m; }
+        else {
+            gS = stage_g + stage_node2_acc_num[stage_id] + (c < 2 ? c : 2) * stage_node2_acc_num[stage_num];
+            invS = invG; sg = si = n;
+        }
+        // A' = rc_inv[0:m,0:m], inv = I
+        for(int e = threadIdx.x; e < m * m; e += blockDim.x) {
+            int x = e / m, y = e % m;
+            gS[x * sg + y] = rc_inv[idx(x, y, n)];
+            invS[x * si + y] = (x == y ? 1 : 0);
+        }
+        __syncthreads();
+        // receiver pin caps on the port diagonal (port 0 is the driver)
+        if(1 <= threadIdx.x && threadIdx.x < m) {
+            double cap;
+            if(pass == 0) cap = cell_ipin_nldm_cap[cell_ipin_acc_num[cell_num] * (stage_signal[stage_id] % 2) +
+                cell_ipin_acc_num[RC_port_cell_id[RC_port_offset + threadIdx.x]] + RC_port_pin_id[RC_port_offset + threadIdx.x]];
+            else cap = stage_port_cap[(stage_port_acc_num[stage_id] + threadIdx.x) * 3 + c];
+            gS[threadIdx.x * sg + threadIdx.x] += cap * 2 / DELTA_T;
+        }
+        block_gj_inverse(gS, sg, invS, si, m);
+        // top-left block of the full inverse = A'^-1
+        if(in_smem)
+            for(int e = threadIdx.x; e < m * m; e += blockDim.x)
+                invG[idx(e / m, e % m, n)] = invS[(e / m) * si + e % m];
+        __syncthreads();
+        // B: -A'^-1 (B D^-1); C: -(D^-1 C) A'^-1  (rc_inv holds BD^-1 / D^-1C)
+        for(int e = threadIdx.x; e < m * (n - m); e += blockDim.x) {
+            int x = e / (n - m), y = e % (n - m) + m;
+            double acc = 0;
+            for(int i = 0; i < m; i++) acc -= invS[x * si + i] * rc_inv[idx(i, y, n)];
+            invG[idx(x, y, n)] = acc;
+        }
+        for(int e = threadIdx.x; e < (n - m) * m; e += blockDim.x) {
+            int x = e / m + m, y = e % m;
+            double acc = 0;
+            for(int i = 0; i < m; i++) acc -= rc_inv[idx(x, i, n)] * invS[i * si + y];
+            invG[idx(x, y, n)] = acc;
+        }
+        __syncthreads();
+        // D: D^-1 + (D^-1 C A'^-1)(B D^-1), using the C block just written
+        for(int e = threadIdx.x; e < (n - m) * (n - m); e += blockDim.x) {
+            int x = e / (n - m) + m, y = e % (n - m) + m;
+            double acc = rc_inv[idx(x, y, n)];
+            for(int i = 0; i < m; i++) acc -= invG[idx(x, i, n)] * rc_inv[idx(i, y, n)];
+            invG[idx(x, y, n)] = acc;
+        }
+        __syncthreads();
+    }
+    // per-node companion caps (matches build_stage_matA)
+    int nc = (pass == 0) ? 2 : (INV3 ? 3 : 2);  // pass0 wrote copies 1&2 identically
+    for(int c = 0; c < nc; c++) {
+        double *cap_g = stage_cap_g + stage_node_acc_num[stage_id] + c * stage_node_acc_num[stage_num];
+        for(int t = threadIdx.x; t < n; t += blockDim.x) {
+            double v = RC_cap_g[RC_node_offset + t];
+            if(1 <= t && t < m) {
+                double cap;
+                if(pass == 0) cap = cell_ipin_nldm_cap[cell_ipin_acc_num[cell_num] * (stage_signal[stage_id] % 2) +
+                    cell_ipin_acc_num[RC_port_cell_id[RC_port_offset + t]] + RC_port_pin_id[RC_port_offset + t]];
+                else cap = stage_port_cap[(stage_port_acc_num[stage_id] + t) * 3 + c];
+                v += cap * 2 / DELTA_T;
+            }
+            cap_g[t] = v;
+        }
+    }
+}
+
+// Fused replacement for the build_input_inv pivot chain: one block per
+// (signal, input net) inverts the (n+1)x(n+1) MNA matrix built by
+// build_input_mat (indefinite: zero diagonal at the source row, so this
+// stays Gauss-Jordan).
+__global__ void block_input_inv_full(int *input_node2_acc_num, int input_num, int tot, int scap) {
+    extern __shared__ double sh[];
+    int signal = blockIdx.x / input_num, net_index = blockIdx.x % input_num;
+    int net_id = input_nets[net_index], s = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id] + 1;
+    double *gG = input_g + signal * tot + input_node2_acc_num[net_index];
+    double *invG = input_inv + signal * tot + input_node2_acc_num[net_index];
+    if(s <= scap) {
+        double *gS = sh, *invS = sh + s * s;
+        for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
+            gS[e] = gG[e];
+            invS[e] = (e / s == e % s ? 1 : 0);
+        }
+        block_gj_inverse(gS, s, invS, s, s);
+        for(int e = threadIdx.x; e < s * s; e += blockDim.x) invG[e] = invS[e];
+    } else
+        block_gj_inverse(gG, s, invG, s, s);
+}
+
+// Fused replacement for the prebuild_RC_invD pivot chain + build_RC_invBC +
+// build_RC_invA: one block per net eliminates the internal-node block D,
+// then forms B D^-1, D^-1 C, and A - B D^-1 C in RC_inv.
+__global__ void block_RC_prebuild(int *net_type_dev, int scap) {
+    extern __shared__ double sh[];
+    int net_id = blockIdx.x;
+    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
+    int m = RC_port_acc_num[net_id + 1] - RC_port_acc_num[net_id];
+    double *g = RC_g + RC_node2_acc_num[net_id], *inv = RC_inv + RC_node2_acc_num[net_id];
+    int s = n - m;
+    if(net_type_dev[net_id] > 0 && s > 0) {
+        if(s <= scap) {
+            double *gS = sh, *invS = sh + s * s;
+            for(int e = threadIdx.x; e < s * s; e += blockDim.x) {
+                gS[e] = g[idx(e / s + m, e % s + m, n)];
+                invS[e] = (e / s == e % s ? 1 : 0);
+            }
+            block_gj_inverse(gS, s, invS, s, s);
+            // g's D block is dead scratch after elimination; only D^-1 persists
+            for(int e = threadIdx.x; e < s * s; e += blockDim.x)
+                inv[idx(e / s + m, e % s + m, n)] = invS[e];
+        } else
+            block_gj_inverse(g + m * n + m, n, inv + m * n + m, n, s);
+    }
+    __syncthreads();
+    // B D^-1 and D^-1 C (matches build_RC_invBC)
+    for(int e = threadIdx.x; e < m * s; e += blockDim.x) {
+        int x = e / s, y = e % s + m;
+        double acc = 0;
+        for(int j = m; j < n; j++) acc += g[idx(x, j, n)] * inv[idx(j, y, n)];
+        inv[idx(x, y, n)] = acc;
+    }
+    for(int e = threadIdx.x; e < s * m; e += blockDim.x) {
+        int x = e / m + m, y = e % m;
+        double acc = 0;
+        for(int j = m; j < n; j++) acc += inv[idx(x, j, n)] * g[idx(j, y, n)];
+        inv[idx(x, y, n)] = acc;
+    }
+    __syncthreads();
+    // A - B D^-1 C (matches build_RC_invA)
+    for(int e = threadIdx.x; e < m * m; e += blockDim.x) {
+        int x = e / m, y = e % m;
+        double acc = g[idx(x, y, n)];
+        for(int j = m; j < n; j++) acc -= inv[idx(x, j, n)] * g[idx(j, y, n)];
+        inv[idx(x, y, n)] = acc;
+    }
+}
+
+// Largest matrix dimension whose (g, inv) pair fits in one block's dynamic
+// shared memory; also opts the kernel into the full per-block carveout.
+int block_setup_scap(const void *func) {
+    static int smax = -1;
+    if(smax < 0) {
+        cudaDeviceGetAttribute(&smax, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        smax -= 1024;  // headroom for static shared usage
+    }
+    cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smax);
+    int s = 1;
+    while(2.0 * (s + 1) * (s + 1) * sizeof(double) <= smax) s++;
+    return s;
+}
+
+
 __global__ void pass0(int stage_offset) {
     extern __shared__ double shared[];
 
@@ -2271,14 +2505,23 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             cudaMemcpy(input_idx2net, input_idx2net_cpu, sizeof(int) * input_node2_acc_num_cpu[input_num], cudaMemcpyHostToDevice);
             build_input_mat<<<input_num * 2, max_RC_node_count + 1>>> (input_node2_acc_num, input_num);
 
-            for(int i = 0; i <= max_RC_node_count; i++) if(RC_size_count[i] > 0)
-                build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[RC_size_count[i]]), THREAD_NUM>>>
-                    (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[RC_size_count[i]], input_node2_acc_num_cpu[input_num], i, 0);
-            for(int i = max_RC_node_count; i >= 0; i--) if(RC_size_count[i] > 0)
-                build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[RC_size_count[i]]), THREAD_NUM>>>
-                    (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[RC_size_count[i]], input_node2_acc_num_cpu[input_num], i, 1);
-            build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[input_num]), THREAD_NUM>>>
-                (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[input_num], input_node2_acc_num_cpu[input_num], 0, 2);
+            if(SETUP_MODE == 1) {
+                int max_s = 0;
+                for(int i = 0; i < input_num; i++) max_s = max(max_s, nets[input_nets_cpu[i]].n + 1);
+                int scap = block_setup_scap((const void*)block_input_inv_full);
+                int sfit = min(scap, max_s);
+                block_input_inv_full<<<input_num * 2, SETUP_THREADS, 2 * sfit * sfit * sizeof(double)>>>
+                    (input_node2_acc_num, input_num, input_node2_acc_num_cpu[input_num], scap);
+            } else {
+                for(int i = 0; i <= max_RC_node_count; i++) if(RC_size_count[i] > 0)
+                    build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[RC_size_count[i]]), THREAD_NUM>>>
+                        (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[RC_size_count[i]], input_node2_acc_num_cpu[input_num], i, 0);
+                for(int i = max_RC_node_count; i >= 0; i--) if(RC_size_count[i] > 0)
+                    build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[RC_size_count[i]]), THREAD_NUM>>>
+                        (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[RC_size_count[i]], input_node2_acc_num_cpu[input_num], i, 1);
+                build_input_inv<<<BLOCK_NUM(2 * input_node2_acc_num_cpu[input_num]), THREAD_NUM>>>
+                    (input_node2_acc_num, input_idx2net, input_node2_acc_num_cpu[input_num], input_node2_acc_num_cpu[input_num], 0, 2);
+            }
 
             calc_delay_input_new<<<input_num, max_RC_node_count + 1, (max_RC_node_count + 1) * sizeof(double)>>> (input_node2_acc_num, input_node2_acc_num_cpu[input_num], 20, 0);
             calc_delay_input_new<<<input_num, max_RC_node_count + 1, (max_RC_node_count + 1) * sizeof(double)>>> (input_node2_acc_num, input_node2_acc_num_cpu[input_num], 20, 1);
@@ -2290,13 +2533,22 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
 
         GCS_PROF::HostSection sec_sta("GPU STA total (setup+pass0+pass1+propagate)");
         GCS_PROF::GpuSection sec_setup0("pass0 setup: matA + invA/invBC/invD chain");
-        build_stage_matA<<<stage_num, max_RC_node_count>>> (0);
-        for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 0);
-        for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 0);
-        build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], 0, 2, 0);
-        build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 0, 0);
-        build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 0);
-        build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 0);//rely on build_stage_invBC(0)
+        int stage_scap = 0, stage_sfit = 0;
+        if(SETUP_MODE == 1) {
+            stage_scap = block_setup_scap((const void*)block_stage_setup);
+            stage_sfit = min(stage_scap, max_RC_port_count);
+        }
+        if(SETUP_MODE == 1)
+            block_stage_setup<<<stage_num, SETUP_THREADS, 2 * stage_sfit * stage_sfit * sizeof(double)>>> (0, stage_scap);
+        else {
+            build_stage_matA<<<stage_num, max_RC_node_count>>> (0);
+            for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 0);
+            for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 0);
+            build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], 0, 2, 0);
+            build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 0, 0);
+            build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 0);
+            build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 0);//rely on build_stage_invBC(0)
+        }
 
         cudaDeviceSynchronize();
         assert(cudaGetLastError() == cudaSuccess);
@@ -2317,15 +2569,19 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
         sec_pass0.end();
 
         GCS_PROF::GpuSection sec_setup1("pass1 setup: refactorization chain");
-        build_stage_matA<<<stage_num, max_RC_node_count>>> (1);
-        for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 1);
-        for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 1);
-        build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], 0, 2, 1);
+        if(SETUP_MODE == 1)
+            block_stage_setup<<<stage_num, SETUP_THREADS, 2 * stage_sfit * stage_sfit * sizeof(double)>>> (1, stage_scap);
+        else {
+            build_stage_matA<<<stage_num, max_RC_node_count>>> (1);
+            for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 1);
+            for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 1);
+            build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], 0, 2, 1);
 
-        build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 0, 1);
-        build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 1);
+            build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 0, 1);
+            build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 1);
 
-        build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 1);//rely on build_stage_invBC(0)
+            build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 1);//rely on build_stage_invBC(0)
+        }
         sec_setup1.end();
         {
             GCS_PROF::GpuSection sec_pass1("pass1 simulate (size groups)");
