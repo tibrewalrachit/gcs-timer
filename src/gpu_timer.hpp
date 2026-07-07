@@ -1,9 +1,95 @@
 #include "ccs.hpp"
 
+#include <chrono>
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define GCS_NVTX 1
+#else
+#define GCS_NVTX 0
+#endif
+
+// Wall-clock instrumentation: cudaEvent pairs for GPU sections, steady_clock
+// for host sections, NVTX ranges around every pipeline section so nsys
+// timelines carry the same names as the printed breakdown.
+namespace GCS_PROF {
+
+bool quiet = false;  // -quiet / -nsys: suppress per-pin report spam
+
+struct Section { std::string name; double ms; };
+std::vector<Section> sections;
+
+void push_range(const char *name) {
+#if GCS_NVTX
+    nvtxRangePushA(name);
+#endif
+}
+void pop_range() {
+#if GCS_NVTX
+    nvtxRangePop();
+#endif
+}
+
+// Times GPU work submitted on the default stream between construction and end().
+struct GpuSection {
+    cudaEvent_t e0, e1;
+    std::string name;
+    GpuSection(std::string n) : name(std::move(n)) {
+        push_range(name.c_str());
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        cudaEventRecord(e0);
+    }
+    double end() {
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+        pop_range();
+        sections.push_back({name, ms});
+        return ms;
+    }
+};
+
+// Times host (or mixed host+GPU) work by wall clock.
+struct HostSection {
+    std::chrono::steady_clock::time_point t0;
+    std::string name;
+    HostSection(std::string n) : t0(std::chrono::steady_clock::now()), name(std::move(n)) {
+        push_range(name.c_str());
+    }
+    double end() {
+        double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        pop_range();
+        sections.push_back({name, ms});
+        return ms;
+    }
+};
+
+void report() {
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    double tot = 0;
+    printf("\n---------------- timing breakdown (ms) ----------------\n");
+    for (auto &s : sections) {
+        printf("%-44s%12.2f\n", s.name.c_str(), s.ms);
+        tot += s.ms;
+    }
+    printf("%-44s%12.2f\n", "TOTAL (sum of sections)", tot);
+    printf("%-44s%12.2f\n", "device memory in use (MB)",
+           (total_b - free_b) / 1024.0 / 1024.0);
+    printf("--------------------------------------------------------\n");
+}
+
+}  // namespace GCS_PROF
 
 namespace GPU_TIMER {
 
+#ifndef EVALUATE
 #define EVALUATE 0
+#endif
 #define TABLE_LEN 7
 #define DELTA_T 2.5
 #define THREAD_NUM 512
@@ -76,13 +162,7 @@ __managed__ int *cell_ipin_acc_num, *gate_ipin_acc_num, *stage_node_acc_num;
 __managed__ double *RC_node_cap, *RC_res, *cell_ipin_nldm_cap, *basic_mat, *inslew, *stage_cap_g;
 int *inode2_acc_num_to_net_cpu, *stage_node_acc_num_cpu;
 
-__global__ void print_mat(double *mat, int n) {
-    printf("print mat\n");
-    for(int i = 0; i < n; i++) {
-        for(int j = 0; j < n; j++) printf("%13.3f", mat[idx(i, j, n)]);
-        printf("\n");
-    }    
-}
+
 
 struct net {
 
@@ -365,7 +445,6 @@ void design::add_pin_net(string pin, int net_id, int gate_id) {
 
 
 void design::read_spef(string filename) {
-    double _t = clock();
     auto tokens = tokenize(filename, "", "");
 
     const double RES_SCALE = tokens[find(tokens, "*R_UNIT", 0) + 2] == "OHM" ? 0.001 : 1;//scale resistance to KOHM
@@ -728,7 +807,6 @@ double design::compute_delay_internal(double input_slew, net &net, CCS::ccs_tabl
 
 
     auto simulate = [&] (vector<double> slews1, vector<double> slews2, bool nldm_cap) {
-        double _t = clock();
         lastI = zero_vec;
         sim_times = {double(table.tp[1][0][0])};
         sim_voltages = {lastV = vector<double> (n, 1) * double(deltaV)};
@@ -791,188 +869,9 @@ __device__ double lerp(double x0, double x1, double coeff) {
     return x0 * (1 - coeff) + x1 * coeff;
 }
 
-__global__ void calc_delay_input_0_small(double input_slew, int signal) {
-    extern __shared__ double shared[];//(n+1)*(2n+3)
-    __shared__ int achieve_num;
-    if(threadIdx.x == 0) achieve_num = 0;
-
-    int net_id = input_nets[blockIdx.x];
-    int node_offset = RC_node_acc_num[net_id - 1];
-    int port_offset = RC_port_acc_num[net_id - 1];
-    int n = RC_node_acc_num[net_id] - RC_node_acc_num[net_id - 1];
-    int m = RC_port_acc_num[net_id] - RC_port_acc_num[net_id - 1];
-
-    assert(blockDim.x > n);
-
-    const double deltaT = input_slew / 10, V_T_SLOPE = 0.8 * VDD / input_slew;
-
-    double cap_g, *I_src = shared, *g = I_src + n + 1, *inv = g + (n + 1) * (n + 1);
-
-    //initialize g & inv
-    for(int i = 0; i * blockDim.x + threadIdx.x < (n + 1) * (n + 1); i++) 
-        g[i * blockDim.x + threadIdx.x] = inv[i * blockDim.x + threadIdx.x] = 0;
-    __syncthreads();
-    if(threadIdx.x < n) cap_g = RC_node_cap[node_offset + threadIdx.x];
-    if(threadIdx.x <= n) inv[idx(threadIdx.x, threadIdx.x, n + 1)] = 1;
-    __syncthreads();
-    if(1 <= threadIdx.x && threadIdx.x < m) cap_g += cell_ipin_nldm_cap[cell_ipin_acc_num[cell_num] * signal
-        + cell_ipin_acc_num[RC_port_cell_id[port_offset + threadIdx.x] - 1] + RC_port_pin_id[port_offset + threadIdx.x]];
-    if(threadIdx.x < n)
-        g[idx(threadIdx.x, threadIdx.x, n + 1)] += (cap_g *= 2 / deltaT);
-    __syncthreads();
-    if(threadIdx.x < n && RC_res[node_offset + threadIdx.x] > 0) {
-        int u = RC_res_node0[node_offset + threadIdx.x], v = RC_res_node1[node_offset + threadIdx.x];
-        double conductance = 1.0 / RC_res[node_offset + threadIdx.x];
-        atomicAdd(g + idx(u, u, n + 1), conductance);
-        atomicAdd(g + idx(v, v, n + 1), conductance);
-        atomicAdd(g + idx(u, v, n + 1), -conductance);
-        atomicAdd(g + idx(v, u, n + 1), -conductance);
-    }
-    if(threadIdx.x == 0) g[idx(n, 0, n + 1)] = g[idx(0, n, n + 1)] = 1;
-    __syncthreads();
-
-    //compute inv from g
-    for(int i = 0; i <= n; i++)
-        for(int j = i + 1; j <= n; j++) {
-            double coeff = g[idx(j, i, n + 1)] / g[idx(i, i, n + 1)];
-            __syncthreads();
-            if(threadIdx.x <= n) {
-                g[idx(j, threadIdx.x, n + 1)] -= coeff * g[idx(i, threadIdx.x, n + 1)];
-                inv[idx(j, threadIdx.x, n + 1)] -= coeff * inv[idx(i, threadIdx.x, n + 1)];
-            }
-            __syncthreads();
-        }
-    for(int i = n; i >= 0; i--) {
-        for(int j = 0; j < i; j++) {
-            double coeff = g[idx(j, i, n + 1)] / g[idx(i, i, n + 1)];
-            __syncthreads();
-            if(threadIdx.x <= n) {
-                g[idx(j, threadIdx.x, n + 1)] -= coeff * g[idx(i, threadIdx.x, n + 1)];
-                inv[idx(j, threadIdx.x, n + 1)] -= coeff * inv[idx(i, threadIdx.x, n + 1)];
-            }
-            __syncthreads();
-        }
-        if(threadIdx.x <= n) inv[idx(i, threadIdx.x, n + 1)] /= g[idx(i, i, n + 1)];
-    }
-    __syncthreads();
-
-    double lastI = 0, lastV = 0, curV = 0, sim_time = 0, port_slew = 0;
-    while(1) {
-        if(threadIdx.x < n) I_src[threadIdx.x] = cap_g * lastV + lastI;
-        if(threadIdx.x == n) I_src[threadIdx.x] = min(VDD, V_T_SLOPE * (sim_time + deltaT));
-        __syncthreads();
-        if(threadIdx.x < n) {
-            curV = 0;
-            for(int i = 0; i <= n; i++) curV += inv[idx(threadIdx.x, i, n + 1)] * I_src[i];
-            lastI = cap_g * (curV - lastV) - lastI;
-            if(threadIdx.x < m && lastV < 0.1 * VDD && curV >= 0.1 * VDD)
-                port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.1 * VDD);
-            if(threadIdx.x < m && lastV < 0.9 * VDD && curV >= 0.9 * VDD) {
-                port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.9 * VDD) - port_slew;
-                atomicAdd(&achieve_num, 1);
-            }
-            lastV = curV;
-        }
-        __syncthreads();
-        sim_time += deltaT;
-        if(achieve_num == m) break;
-    }
-    if(threadIdx.x < m)
-        printf("test%2d slew[%d] = %.4f\n", blockIdx.x, threadIdx.x, port_slew);
-}
-
-__global__ void calc_delay_input_0_large(double input_slew, int signal, int net_offset) {
-    extern __shared__ double I_src[];
-    __shared__ int achieve_num;
-    if(threadIdx.x == 0) achieve_num = 0;
-
-    int net_id = input_nets[blockIdx.x + net_offset];
-    int node_offset = RC_node_acc_num[net_id], n = RC_node_acc_num[net_id + 1] - node_offset;
-    int port_offset = RC_port_acc_num[net_id], m = RC_port_acc_num[net_id + 1] - port_offset;
-    
-    double *g = input_g + RC_input_node2_acc_num[net_id];
-    double *inv = input_inv + RC_input_node2_acc_num[net_id];
-
-    assert(blockDim.x > n);
-
-    const double deltaT = input_slew / 10, V_T_SLOPE = 0.8 * VDD / input_slew;
-
-    double cap_g;
-
-    
-
-    //initialize g & inv
-    for(int i = 0; i * blockDim.x + threadIdx.x < (n + 1) * (n + 1); i++) 
-        g[i * blockDim.x + threadIdx.x] = inv[i * blockDim.x + threadIdx.x] = 0;
-    __syncthreads();
-    if(threadIdx.x < n) cap_g = RC_node_cap[node_offset + threadIdx.x];
-    if(threadIdx.x <= n) inv[idx(threadIdx.x, threadIdx.x, n + 1)] = 1;
-    __syncthreads();
-    if(1 <= threadIdx.x && threadIdx.x < m) cap_g += cell_ipin_nldm_cap[cell_ipin_acc_num[cell_num] * signal +
-        cell_ipin_acc_num[RC_port_cell_id[port_offset + threadIdx.x]] + RC_port_pin_id[port_offset + threadIdx.x]];
-    if(threadIdx.x < n)
-        g[idx(threadIdx.x, threadIdx.x, n + 1)] += (cap_g *= 2 / deltaT);
-    __syncthreads();
-    if(threadIdx.x < n && RC_res[node_offset + threadIdx.x] > 0) {
-        int u = RC_res_node0[node_offset + threadIdx.x], v = RC_res_node1[node_offset + threadIdx.x];
-        double conductance = 1.0 / RC_res[node_offset + threadIdx.x];
-        atomicAdd(g + idx(u, u, n + 1), conductance);
-        atomicAdd(g + idx(v, v, n + 1), conductance);
-        atomicAdd(g + idx(u, v, n + 1), -conductance);
-        atomicAdd(g + idx(v, u, n + 1), -conductance);
-    }
-    if(threadIdx.x == 0) g[idx(n, 0, n + 1)] = g[idx(0, n, n + 1)] = 1;
-    __syncthreads();
 
 
-    //compute inv from g
-    for(int i = 0; i <= n; i++)
-        for(int j = i + 1; j <= n; j++) {
-            double coeff = g[idx(j, i, n + 1)] / g[idx(i, i, n + 1)];
-            __syncthreads();
-            if(threadIdx.x <= n) {
-                g[idx(j, threadIdx.x, n + 1)] -= coeff * g[idx(i, threadIdx.x, n + 1)];
-                inv[idx(j, threadIdx.x, n + 1)] -= coeff * inv[idx(i, threadIdx.x, n + 1)];
-            }
-            __syncthreads();
-        }
-    for(int i = n; i >= 0; i--) {
-        for(int j = 0; j < i; j++) {
-            double coeff = g[idx(j, i, n + 1)] / g[idx(i, i, n + 1)];
-            __syncthreads();
-            if(threadIdx.x <= n) {
-                g[idx(j, threadIdx.x, n + 1)] -= coeff * g[idx(i, threadIdx.x, n + 1)];
-                inv[idx(j, threadIdx.x, n + 1)] -= coeff * inv[idx(i, threadIdx.x, n + 1)];
-            }
-            __syncthreads();
-        }
-        if(threadIdx.x <= n) inv[idx(i, threadIdx.x, n + 1)] /= g[idx(i, i, n + 1)];
-    }
-    __syncthreads();
-    double lastI = 0, lastV = 0, curV = 0, sim_time = 0, port_slew = 0;
-    while(1) {
-        if(threadIdx.x < n) I_src[threadIdx.x] = cap_g * lastV + lastI;
-        if(threadIdx.x == n) I_src[threadIdx.x] = min(VDD, V_T_SLOPE * (sim_time + deltaT));
-        __syncthreads();
-        if(threadIdx.x < n) {
-            curV = 0;
-            for(int i = 0; i <= n; i++) curV += inv[idx(threadIdx.x, i, n + 1)] * I_src[i];
-            lastI = cap_g * (curV - lastV) - lastI;
-            if(threadIdx.x < m && lastV < 0.1 * VDD && curV >= 0.1 * VDD)
-                port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.1 * VDD);
-            if(threadIdx.x < m && lastV < 0.9 * VDD && curV >= 0.9 * VDD) {
-                port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.9 * VDD) - port_slew;
-                atomicAdd(&achieve_num, 1);
-            }
-            lastV = curV;
-        }
-        __syncthreads();
-        sim_time += deltaT;
-        if(achieve_num == m) break;
-    }    
-    if(0 < threadIdx.x && threadIdx.x < m) inslew[gate_ipin_acc_num[gate_num] * signal + gate_ipin_acc_num[
-        RC_port_gate_id[port_offset + threadIdx.x]] + RC_port_pin_id[port_offset + threadIdx.x]] = port_slew;
-}
+
 
 __global__ void calc_delay_input_new(int *input_node2_acc_num, int tot_node2, double input_slew, int signal) {
     extern __shared__ double I_src[];
@@ -1260,61 +1159,9 @@ __global__ void build_RC_g() {
         atomicAdd(g + idx(threadIdx.x, threadIdx.x, n), cap_g[threadIdx.x]);
     }
 }
-__global__ void build_RC_invD(int tot_inode2, int pivot, int type) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= tot_inode2) return;
-    int net_id = inode2_acc_num_to_net[idx];
-    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
-    int m = RC_port_acc_num[net_id + 1] - RC_port_acc_num[net_id];
-    pivot += m;
-    if(pivot >= n) return;
-    int x = (idx - RC_inode2_acc_num[net_id]) / (n - m) + m, y = (idx - RC_inode2_acc_num[net_id]) % (n - m) + m;
-    assert(x < n);
-    double *g = RC_g + RC_node2_acc_num[net_id], *inv = RC_inv + RC_node2_acc_num[net_id];
-    if(type == 0) {
-        if(x > pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        }
-    } else if(type == 1) {
-        if(x < pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        } 
-    } else if(type == 2) {
-        inv[idx(x, y, n)] /= g[idx(x, x, n)];
-    }    
-}
+
 /*
-__global__ void sorted_build_RC_invD(int tot_inode2, int pivot, int type) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= tot_inode2) return;
-    int net_id = sorted_net_id[sorted_inode2_acc_num_to_net[idx]];
-    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
-    int m = RC_port_acc_num[net_id + 1] - RC_port_acc_num[net_id];
-    pivot += m;
-    if(pivot >= n) return;
-    int x = (idx - RC_inode2_acc_num[net_id]) / (n - m) + m, y = (idx - RC_inode2_acc_num[net_id]) % (n - m) + m;
-    assert(x < n);
-    double *g = RC_g + RC_node2_acc_num[net_id], *inv = RC_inv + RC_node2_acc_num[net_id];
-    if(type == 0) {
-        if(x > pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        }
-    } else if(type == 1) {
-        if(x < pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        } 
-    } else if(type == 2) {
-        inv[idx(x, y, n)] /= g[idx(x, x, n)];
-    }    
-}*/
+*/
 
 __global__ void build_RC_invBC() {
     int net_id = blockIdx.x;
@@ -1383,7 +1230,6 @@ __global__ void prebuild_RC_invD(int *offset, int *net, int tot_inode2, int pivo
 
 void design:: prebuild() {
 
-    double t = clock();
     vector<vector<int>> inode2net(max_RC_inode_count + 1);
     vector<int> inode2_sum(max_RC_inode_count + 1);
     int tot_inode2 = 0, *index2net_cpu, *index2offset_cpu;
@@ -1655,7 +1501,6 @@ __global__ void inode2_to_stage() {
 
 const vector<int> sizes = {0, 32, 1024};
 void design::init_graph_GPU() {
-    double t = clock();
     topo = levelize();
     level_stage_acc_num = vector<int> (topo.size() + 1, 0);
     for(int i = 1; i <= topo.size(); i++) {
@@ -1764,23 +1609,7 @@ void design::init_graph_GPU() {
         stage_port2_acc_num_cpu[stage_num] + stage_node2_acc_num_cpu[stage_num];
     cerr << temp * sizeof(int) / 1024 / 1024 / 1024 << "GB" << endl;
 
-    /*node2_acc_num_to_stage_cpu = new int[stage_node2_acc_num_cpu[stage_num]]();
-    port2_acc_num_to_stage_cpu = new int[stage_port2_acc_num_cpu[stage_num]]();
-    portinode_acc_num_to_stage_cpu = new int[stage_portinode_acc_num_cpu[stage_num]]();
-    inode2_acc_num_to_stage_cpu = new int[stage_inode2_acc_num_cpu[stage_num]]();
-    printf("temp time0 = %.4f\n", (clock() - t) / CLOCKS_PER_SEC);
-    for(int i = 0; i < stage_num; i++) {
-        //for(int j = stage_node2_acc_num_cpu[i]; j < stage_node2_acc_num_cpu[i + 1]; j++) node2_acc_num_to_stage_cpu[j] = i;
-        for(int j = stage_port2_acc_num_cpu[i]; j < stage_port2_acc_num_cpu[i + 1]; j++) port2_acc_num_to_stage_cpu[j] = i;
-        for(int j = stage_portinode_acc_num_cpu[i]; j < stage_portinode_acc_num_cpu[i + 1]; j++) portinode_acc_num_to_stage_cpu[j] = i;
-        for(int j = stage_inode2_acc_num_cpu[i]; j < stage_inode2_acc_num_cpu[i + 1]; j++) inode2_acc_num_to_stage_cpu[j] = i;
-    }
-    printf("temp time0.5 = %.4f\n", (clock() - t) / CLOCKS_PER_SEC);
-    cudaMemcpy(node2_acc_num_to_stage, node2_acc_num_to_stage_cpu, stage_node2_acc_num_cpu[stage_num] * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(port2_acc_num_to_stage, port2_acc_num_to_stage_cpu, stage_port2_acc_num_cpu[stage_num] * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(portinode_acc_num_to_stage, portinode_acc_num_to_stage_cpu, stage_portinode_acc_num_cpu[stage_num] * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(inode2_acc_num_to_stage, inode2_acc_num_to_stage_cpu, stage_inode2_acc_num_cpu[stage_num] * sizeof(int), cudaMemcpyHostToDevice);
-    */
+    
     node2_to_stage<<<stage_num, 1024>>> ();
     port2_to_stage<<<stage_num, 1024>>> ();
     portinode_to_stage<<<stage_num, 1024>>> ();
@@ -1821,7 +1650,9 @@ void design::init_graph_GPU() {
     cudaMemcpy(RC_ccs_cap, RC_ccs_cap_cpu, RC_port_acc_num_cpu[net_num] * TABLE_LEN * 4 * sizeof(double), cudaMemcpyHostToDevice);
 
     cudaDeviceSynchronize();
-    printf("[END] init graph. error = %d\n", cudaGetLastError());
+    cudaError_t init_err = cudaGetLastError();
+    if(init_err != cudaSuccess || !GCS_PROF::quiet)
+        printf("[END] init graph. error = %d\n", init_err);
 }
 
 
@@ -1945,31 +1776,7 @@ __global__ void build_stage_matA(int pass, int offset = 0) {//compute A - BD^{-1
         if(INV3) cap_g3[threadIdx.x] += cap3;
     }
 }
-__global__ void build_mat_inv(int stage_node2_num_offset, int stage_node2_num, int pivot, int type) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= stage_node2_num) return;
-    int stage_id = node2_acc_num_to_stage[stage_node2_num_offset + idx], net_id = stage_net_id[stage_id];
-    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
-    if(pivot >= n) return;
-    idx += stage_node2_num_offset - stage_node2_acc_num[stage_id];
-    int x = idx / n, y = idx % n;
-    double *g = stage_g + stage_node2_acc_num[stage_id], *inv = stage_inv + stage_node2_acc_num[stage_id];
-    if(type == 0) {
-        if(x > pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        }
-    } else if(type == 1) {
-        if(x < pivot) {
-            double coeff = g[idx(x, pivot, n)] / g[idx(pivot, pivot, n)];
-            if(y > pivot) g[idx(x, y, n)] -= coeff * g[idx(pivot, y, n)];
-            inv[idx(x, y, n)] -= coeff * inv[idx(pivot, y, n)];
-        } 
-    } else if(type == 2) {
-        inv[idx(x, y, n)] /= g[idx(x, x, n)];
-    }    
-}
+
 __global__ void build_stage_invA(int stage_port2_num, int pivot, int type, int pass, int offset = 0) {
     //if(blockIdx.x == 0 && threadIdx.x == 0) printf("stage_port2_num=%d\n", stage_port2_num);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2104,23 +1911,7 @@ __global__ void build_stage_invD(int tot_inode2_num, int pass, int offset = 0) {
     }
 }
 
-__global__ void print(int stage_id) {
-    int net_id = stage_net_id[stage_id];
-    int n = RC_node_acc_num[net_id + 1] - RC_node_acc_num[net_id];
-    double *g = stage_g + stage_node2_acc_num[stage_id], *inv = stage_inv + stage_node2_acc_num[stage_id];
-    printf("print MY g \n");
-    for(int i = 0; i < n; i++) {
-        for(int j = 0; j < n; j++)
-            printf("%13.3f", g[idx(i, j, n)]);
-        printf("\n");
-    }    
-    printf("print MY inv\n");
-    for(int i = 0; i < n; i++) {
-        for(int j = 0; j < n; j++)
-            printf("%12.4f", inv[idx(i, j, n)]);
-        printf("\n");
-    }
-}
+
 
 __global__ void pass0(int stage_offset) {
     extern __shared__ double shared[];
@@ -2393,148 +2184,7 @@ __global__ void propagate(int stage_offset) {
 }
 
 
-__global__ void calc_delay_0_general(int stage_offset) {
-    extern __shared__ double shared[];
-    __shared__ int achieve_num;//, stage_id, net_id, gate_id, arc_id, ipin, isignal, osignal
-    if(threadIdx.x == 0) achieve_num = 0;
 
-    int stage_id = blockIdx.x + stage_offset;
-    int net_id = stage_net_id[stage_id], gate_id = stage_driver_gate_id[stage_id], arc_id = stage_arc_id[stage_id];
-    int ipin = stage_driver_ipin[stage_id], isignal = stage_signal[stage_id] / 2, osignal = stage_signal[stage_id] % 2;
-    int RC_node_offset = RC_node_acc_num[net_id], n = RC_node_acc_num[net_id + 1] - RC_node_offset;
-    int RC_port_offset = RC_port_acc_num[net_id], m = RC_port_acc_num[net_id + 1] - RC_port_offset;
-    int olen = ccs_acc_olen[arc_id + 1] - ccs_acc_olen[arc_id];
-    double *initial_tp = ccs_tp + ccs_acc_tlen[arc_id], *g = stage_g + stage_node2_acc_num[stage_id], *inv = stage_inv + stage_node2_acc_num[stage_id];
-    double *I_src = shared, *output_cap = I_src + n, *tp = output_cap + olen + 2;
-    double cap_g, slew = inslew[gate_ipin_acc_num[gate_num] * isignal + gate_ipin_acc_num[gate_id] + ipin];
-
-    if(threadIdx.x == 0) output_cap[0] = ccs_output_cap[ccs_acc_olen[arc_id]] * 0.2;
-    if(1 <= threadIdx.x && threadIdx.x <= olen) output_cap[threadIdx.x] = ccs_output_cap[ccs_acc_olen[arc_id] + threadIdx.x - 1];
-    if(threadIdx.x == olen + 1) output_cap[threadIdx.x] = ccs_output_cap[ccs_acc_olen[arc_id] + olen - 1] * 1.1;
-
-    assert(blockDim.x >= n);
-    {
-        int ilen = ccs_acc_ilen[arc_id + 1] - ccs_acc_ilen[arc_id];
-        __shared__ int index;
-        __shared__ double coeff;
-        if(threadIdx.x == 0) {
-            index = 0;
-            double *input_slew = ccs_input_slew + ccs_acc_ilen[arc_id];
-            for(int i = 1; i < ilen - 1; i++) if(input_slew[i] < slew) index = i;
-            coeff = (slew - input_slew[index]) / (input_slew[index + 1] - input_slew[index]);
-        }
-        __syncthreads();
-        for(int i = 0; i * blockDim.x + threadIdx.x < 3 * VPLEN * olen; i++) {
-            int temp = i * blockDim.x + threadIdx.x, t = temp / VPLEN / olen, a = temp / olen % VPLEN, b = temp % olen;
-            tp[idx3D(t, a, b + 1, VPLEN, olen + 2)] = initial_tp[idx3D(t, index, b, ilen, olen) * VPLEN + a] * (1 - coeff)
-                + initial_tp[idx3D(t, index + 1, b, ilen, olen) * VPLEN + a] * coeff;
-        }
-        __syncthreads();
-        olen += 2;
-        for(int i = 0; i * blockDim.x + threadIdx.x < 3 * VPLEN; i++) {
-            int temp = i * blockDim.x + threadIdx.x, t = temp / VPLEN, a = temp % VPLEN, pos = idx3D(t, a, 0, VPLEN, olen);
-            tp[pos] = tp[pos + 1] - (tp[pos + 2] - tp[pos + 1]) / (output_cap[2] - output_cap[1]) * (output_cap[1] - output_cap[0]);
-            pos = idx3D(t, a, olen - 2, VPLEN, olen);
-            tp[pos + 1] = tp[pos] + (tp[pos] - tp[pos - 1]) / (output_cap[olen - 2] - output_cap[olen - 3]) * (output_cap[olen - 1] - output_cap[olen - 2]);
-        }
-        __syncthreads();
-    }
-
-    const double deltaT = 1;// slew / 20;
-
-    //initialize g & inv
-    for(int i = 0; i * blockDim.x + threadIdx.x < n * n; i++)
-        g[i * blockDim.x + threadIdx.x] = inv[i * blockDim.x + threadIdx.x] = 0;
-    __syncthreads();
-    if(threadIdx.x < n) cap_g = RC_node_cap[RC_node_offset + threadIdx.x];
-    if(threadIdx.x < n) inv[idx(threadIdx.x, threadIdx.x, n)] = 1;
-    __syncthreads();
-    if(1 <= threadIdx.x && threadIdx.x < m) cap_g += cell_ipin_nldm_cap[cell_ipin_acc_num[cell_num] * osignal +
-        cell_ipin_acc_num[RC_port_cell_id[RC_port_offset + threadIdx.x]] + RC_port_pin_id[RC_port_offset + threadIdx.x]];
-    
-    if(threadIdx.x < n)
-        g[idx(threadIdx.x, threadIdx.x, n)] += (cap_g *= 2 / deltaT);
-    __syncthreads();
-    if(threadIdx.x < n && RC_res[RC_node_offset + threadIdx.x] > 0) {
-        int u = RC_res_node0[RC_node_offset + threadIdx.x], v = RC_res_node1[RC_node_offset + threadIdx.x];
-        double conductance = 1.0 / RC_res[RC_node_offset + threadIdx.x];
-        atomicAdd(g + idx(u, u, n), conductance);
-        atomicAdd(g + idx(v, v, n), conductance);
-        atomicAdd(g + idx(u, v, n), -conductance);
-        atomicAdd(g + idx(v, u, n), -conductance);
-    }
-    __syncthreads();
-
-
-
-    //compute inv from g
-    /*if(threadIdx.x == 0 && stage_id == 6063) {
-        printf("  GOLDEN  initial  G\n");
-        for(int i = 0; i < n; i++) {
-            for(int j = 0; j < n; j++)
-                printf("%11.3f", g[idx(i, j, n)]);
-            printf("\n");
-        }
-    }*/
-    
-    for(int i = 0; i < n; i++) {
-        for(int temp = 0; temp * blockDim.x + threadIdx.x < n * (n - i - 1); temp++) {
-            int j = (temp * blockDim.x + threadIdx.x) / n + i + 1, k = (temp * blockDim.x + threadIdx.x) % n;
-            if(k > i) g[idx(j, k, n)] -= g[idx(j, i, n)] / g[idx(i, i, n)] * g[idx(i, k, n)];
-            inv[idx(j, k, n)] -= g[idx(j, i, n)] / g[idx(i, i, n)] * inv[idx(i, k, n)];
-        }
-        __syncthreads();
-        //if(i < threadIdx.x && threadIdx.x < n) g[idx(threadIdx.x, i, n)] = 0;
-    }
-    __syncthreads();
-
-    for(int i = n - 1; i >= 0; i--) {
-        for(int temp = 0; temp * blockDim.x + threadIdx.x < n * i; temp++) {
-            int j = (temp * blockDim.x + threadIdx.x) / n, k = (temp * blockDim.x + threadIdx.x) % n;
-            if(k > i) g[idx(j, k, n)] -= g[idx(j, i, n)] / g[idx(i, i, n)] * g[idx(i, k, n)];
-            inv[idx(j, k, n)] -= g[idx(j, i, n)] / g[idx(i, i, n)] * inv[idx(i, k, n)];
-        }
-        __syncthreads();
-        if(threadIdx.x < n) inv[idx(i, threadIdx.x, n)] /= g[idx(i, i, n)];
-    }
-    __syncthreads();
-    
-
-    double lastI = 0, lastV = 0.01 * VDD, curV, sim_time = tp[idx3D(1, 0, 0, VPLEN, olen)], port_slew = 0;
-    __shared__ double isrc0;
-    while(1) {
-        sim_time += deltaT;
-        if(threadIdx.x < n) I_src[threadIdx.x] = cap_g * lastV + lastI;
-        __syncthreads();
-        if(threadIdx.x < n) for(int i = curV = 0; i < n; i++) curV += inv[idx(threadIdx.x, i, n)] * I_src[i];
-        if(threadIdx.x == 0) {
-            isrc0 = cuda_getI(lastV, sim_time, olen, tp, output_cap);
-            isrc0 = cuda_getI(curV + inv[idx(threadIdx.x, 0, n)] * isrc0, sim_time, olen, tp, output_cap);
-        }
-        __syncthreads();
-        if(threadIdx.x < n) {
-            curV += inv[idx(threadIdx.x, 0, n)] * isrc0;
-            lastI = cap_g * (curV - lastV) - lastI;
-        }
-        if(threadIdx.x < m && lastV < 0.1 * VDD && curV >= 0.1 * VDD)
-            port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.1 * VDD);
-        if(threadIdx.x < m && lastV < 0.9 * VDD && curV >= 0.9 * VDD) {
-            port_slew = lerp(sim_time, sim_time + deltaT, lastV, curV, 0.9 * VDD) - port_slew;
-            atomicAdd(&achieve_num, 1);
-        }
-        lastV = curV;
-        __syncthreads();
-        if(achieve_num == m) break;
-    }
-    if(1 <= threadIdx.x && threadIdx.x < m) 
-        atomicMax64(inslew + gate_ipin_acc_num[gate_num] * osignal + gate_ipin_acc_num[
-            RC_port_gate_id[RC_port_offset + threadIdx.x]] + RC_port_pin_id[RC_port_offset + threadIdx.x], port_slew);
-    int offset = (blockIdx.x + stage_offset) * max_port_num;
-    if(1 <= threadIdx.x && threadIdx.x < m)
-        if(fabs(port_slew - GOLDEN[offset + threadIdx.x]) > 1e-5) {
-            printf("block %d   slew diff: %.10f\n", blockIdx.x, fabs(port_slew - GOLDEN[offset + threadIdx.x]));
-        }
-}
 
 vector<double> operator + (vector<double> a, vector<double> b) {
     for(auto e : b) a.emplace_back(e);
@@ -2547,11 +2197,10 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
 
 
 
-    double GPU_sta_graph_start_time = clock();
-    //reduce_RC();
+    GCS_PROF::HostSection sec_init("init_database_GPU + init_graph_GPU");
     init_database_GPU();
     init_graph_GPU();
-    output_log("init_database_GPU + init_graph_GPU: " + to_string((clock() - GPU_sta_graph_start_time) / CLOCKS_PER_SEC));
+    output_log("init_database_GPU + init_graph_GPU: " + to_string(sec_init.end() / 1000) + "s");
 
 
     if(EVALUATE == 1) {
@@ -2597,8 +2246,8 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
         vector<cudaStream_t> streams(sizes.size());
         for(auto &stream : streams) cudaStreamCreate(&stream);
 
-        double gpu_input_net_time = clock();
-        print_GPU_mem();
+        GCS_PROF::GpuSection sec_input("input nets (mat+inv+delay)");
+        if(!GCS_PROF::quiet) print_GPU_mem();
         {
             int *input_node2_acc_num_cpu = new int[input_num + 1](), *input_node2_acc_num;
             vector<int> RC_size_count(max_RC_node_count + 1, 0);
@@ -2636,10 +2285,11 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
         }
         cudaDeviceSynchronize();
         assert(cudaGetLastError() == cudaSuccess);
-        output_log("GPU input net time: " + to_string((clock() - gpu_input_net_time) / CLOCKS_PER_SEC));
+        output_log("GPU input net time: " + to_string(sec_input.end() / 1000) + "s");
 
 
-        GPU_sta_graph_start_time = clock();
+        GCS_PROF::HostSection sec_sta("GPU STA total (setup+pass0+pass1+propagate)");
+        GCS_PROF::GpuSection sec_setup0("pass0 setup: matA + invA/invBC/invD chain");
         build_stage_matA<<<stage_num, max_RC_node_count>>> (0);
         for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 0);
         for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 0);
@@ -2648,9 +2298,11 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
         build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 0);
         build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 0);//rely on build_stage_invBC(0)
 
-        cudaDeviceSynchronize();    
+        cudaDeviceSynchronize();
         assert(cudaGetLastError() == cudaSuccess);
+        sec_setup0.end();
 
+        GCS_PROF::GpuSection sec_pass0("pass0 simulate (level loop)");
         for(int i = 0; i < topo.size(); i++) {
             int size_sum = 0, size_max = 32;
             for(int j = 1; j < sizes.size(); j++) size_sum += size_num[i][j], size_max = max(size_max, size_max_node_num[i][j]);
@@ -2662,6 +2314,9 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
                 }
             cudaDeviceSynchronize();
         }
+        sec_pass0.end();
+
+        GCS_PROF::GpuSection sec_setup1("pass1 setup: refactorization chain");
         build_stage_matA<<<stage_num, max_RC_node_count>>> (1);
         for(int i = 0; i < max_RC_port_count; i++) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 0, 1);
         for(int i = max_RC_port_count - 1; i >= 0; i--) build_stage_invA<<<BLOCK_NUM(stage_port2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_port2_acc_num_cpu[stage_num], i, 1, 1);
@@ -2671,7 +2326,9 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
         build_stage_invBC<<<BLOCK_NUM(stage_portinode_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_portinode_acc_num_cpu[stage_num], 1, 1);
 
         build_stage_invD<<<BLOCK_NUM(stage_inode2_acc_num_cpu[stage_num]), THREAD_NUM>>> (stage_inode2_acc_num_cpu[stage_num], 1);//rely on build_stage_invBC(0)
+        sec_setup1.end();
         {
+            GCS_PROF::GpuSection sec_pass1("pass1 simulate (size groups)");
             int *sorted_stage_id_cpu = new int[stage_num];
             for(int i = 0; i < stage_num; i++) sorted_stage_id_cpu[i] = i;
             sort(sorted_stage_id_cpu, sorted_stage_id_cpu + stage_num, [&] (int l, int r) {
@@ -2691,12 +2348,14 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
                 pass1<<<group_cnt[i] - offset, group_size[i], (group_size[i] + 430) * sizeof(double)>>> (offset);
                 cudaDeviceSynchronize();
             }
+            sec_pass1.end();
         }
 
         cudaDeviceSynchronize();
 
 
         assert(cudaGetLastError() == cudaSuccess);
+        GCS_PROF::GpuSection sec_prop("propagate + AT readback");
         for(int i = 0; i < topo.size(); i++) {
             int size_sum = 0;
             for(int j = 1; j < sizes.size(); j++) size_sum += size_num[i][j];
@@ -2709,7 +2368,8 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             po_at[0][nets[i].net_name] = output_delay_cpu[i];
             po_at[1][nets[i].net_name] = output_delay_cpu[i + net_num];
         }
-        output_log("GPU STA time: " + to_string((clock() - GPU_sta_graph_start_time) / CLOCKS_PER_SEC));
+        sec_prop.end();
+        output_log("GPU STA time: " + to_string(sec_sta.end() / 1000) + "s");
 
         auto eval = [&] (vector<double> &pt, vector<double> &my, vector<double> &sp, string info) {
             int success_count = 0, tot = sp.size();//sp.size();
@@ -2798,7 +2458,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
     
 
 
-    bool REPORT_OUTPUT = true;
+    bool REPORT_OUTPUT = !GCS_PROF::quiet;
     if(REPORT_OUTPUT) {
         const int WIDTH = 15;
         cout << "\n " << setw(2 * WIDTH) << setfill('-') << " Output AT Report " << setw(WIDTH) << "-" << setfill(' ') << endl;
@@ -2807,6 +2467,7 @@ void design::update_timing(double primary_input_slew, bool useCPU) {
             cout << setw(WIDTH) << net.net_name << setw(WIDTH) << po_at[0][net.net_name] << setw(WIDTH) << po_at[1][net.net_name] << endl;
         }
     }
+    if(!useCPU) GCS_PROF::report();
 }
 
 
