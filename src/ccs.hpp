@@ -276,7 +276,6 @@ int get_cell_id(string cell_name) {
 
 void read_lib(string filename) {
 
-    double t = clock();
     auto tokens = tokenize(filename, "(),:;/#[]{}*\"\\", "(){}");
 
     auto match_pos = [&tokens] {
@@ -295,7 +294,6 @@ void read_lib(string filename) {
         cell_token_range.emplace_back(cur, match_pos[find(tokens, "{", cur)]);
         cur = cell_token_range.back().second;
     }
-    double _t = clock();
     for(auto range : cell_token_range)
         cells.emplace_back(cell(tokens, match_pos, range.first, range.second));
 
